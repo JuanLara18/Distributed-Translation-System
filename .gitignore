@@ -1,0 +1,5 @@
+# For package
+.venv
+
+# For enviroment variables
+.*env
