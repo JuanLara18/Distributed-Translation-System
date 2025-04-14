@@ -1,52 +1,41 @@
 # Distributed Translation System
 
-A robust, scalable system for batch translating text columns in Stata data files using OpenAI language models with PySpark-based distributed processing.
+A robust, scalable system for batch translating text columns in data files using OpenAI language models with PySpark-based distributed processing.
 
 ## Overview
 
-The Distributed Translation System provides an efficient, fault-tolerant solution for translating large datasets by leveraging distributed computing and advanced caching mechanisms. It's specifically designed for researchers and data scientists working with multilingual Stata datasets who need reliable, high-quality translations across multiple text columns.
+The Distributed Translation System provides an efficient, fault-tolerant solution for translating large datasets by leveraging distributed computing and advanced caching mechanisms. It's specifically designed for researchers and data scientists working with multilingual datasets (particularly Stata files) who need reliable, high-quality translations across multiple text columns.
 
 ## Key Features
 
 - **Distributed Processing**: Leverages Apache Spark for parallel translation of large datasets, significantly reducing processing time
-- **Intelligent Caching**: Prevents redundant API calls by storing previously translated texts, reducing costs and improving efficiency
+- **Intelligent Caching**: Prevents redundant API calls with SQLite/PostgreSQL backends, reducing costs and improving efficiency
 - **Checkpointing & Fault Tolerance**: Automatically saves progress and allows resuming interrupted processes
 - **Language Detection**: Optional automatic source language detection when not explicitly specified
 - **Batch Optimization**: Efficiently groups translation requests to minimize API calls
 - **Stata File Handling**: Preserves all metadata, value labels, and variable attributes when processing Stata files
 - **Configurable & Flexible**: Extensive YAML-based configuration with command-line overrides
 
-## Technologies
-
-- **Python 3.7+**: Core implementation language
-- **PySpark**: Distributed computing framework
-- **OpenAI API**: Translation engine (GPT models)
-- **SQLite/PostgreSQL**: Caching backends
-- **PyReadStat**: For Stata file processing
-- **PyYAML**: Configuration management
-- **SQLAlchemy**: Database abstraction (for caching)
-- **Tenacity**: Robust retry mechanisms
-
-## System Architecture
+## Architecture
 
 The system follows a modular architecture with these key components:
 
 - **TranslationOrchestrator**: Coordinates the entire workflow
 - **ConfigManager**: Handles configuration loading and validation
-- **DataReader/DataWriter**: Manages data I/O operations
-- **TranslationManager**: Handles the core translation logic
-- **CacheManager**: Provides efficient translation caching
-- **CheckpointManager**: Ensures fault tolerance
+- **DataReader/DataWriter**: Manages data I/O operations with special handling for Stata files
+- **TranslationManager**: Handles the core translation logic using OpenAI models
+- **CacheManager**: Provides efficient translation caching with multiple backend options
+- **CheckpointManager**: Ensures fault tolerance through granular checkpointing
 
 ## Module Structure
 
 - `main.py`: Entry point and orchestration
+- `config.py`: Configuration management with defaults and validation
 - `translator.py`: Translation service interface and OpenAI implementation
-- `file_manager.py`: Handles reading and writing Stata files
-- `cache.py`: Translation cache implementation
-- `config.py`: Configuration management
-- `checkpoint.py`: Manages process checkpointing
-- `utils.py`: Utility functions and helpers
+- `file_manager.py`: Handles reading and writing various file formats
+- `cache.py`: Translation cache implementation with SQLite, PostgreSQL, and in-memory options
+- `checkpoint.py`: Manages process checkpointing for fault tolerance
+- `utilities.py`: Utility functions and helpers for language detection, etc.
 
 ## Prerequisites
 
@@ -105,7 +94,7 @@ spark:
 ```yaml
 # Cache configuration
 cache:
-  type: "sqlite"  # or "postgres"
+  type: "sqlite"  # or "postgres" or "memory"
   location: "./cache/translations.db"  # for sqlite
   # connection_string: "postgresql://user:password@localhost/translations"  # for postgres
   ttl: 2592000  # 30 days in seconds
@@ -126,11 +115,15 @@ logging:
 retry:
   max_attempts: 3
   backoff_factor: 2
+  
+# Intermediate results
+write_intermediate_results: false
+intermediate_directory: "./intermediate"
 ```
 
 ## API Key Management
 
-This project uses environment variables stored in a `.env` file for API key management. This is the **required** approach for security reasons.
+This project uses environment variables stored in a `.env` file for API key management:
 
 1. Create a `.env` file in the root directory:
    ```
@@ -171,27 +164,20 @@ python main.py --config config.yaml --checkpoint_dir ./custom_checkpoints
 
 ### Processing Different File Types
 
-While the system is optimized for Stata files, it can handle other formats:
+The system supports multiple file formats:
 
 ```bash
+# Stata files (default)
+python main.py --config config.yaml --input_file data.dta --output_file translated.dta
+
 # CSV files
 python main.py --config config.yaml --input_file data.csv --output_file translated.csv
 
 # Parquet files
 python main.py --config config.yaml --input_file data.parquet --output_file translated.parquet
-```
 
-## Monitoring and Logging
-
-The system provides comprehensive logging at different levels:
-
-- **Console Output**: Shows progress bars and summary statistics
-- **Log File**: Detailed logs stored in the configured log file
-- **Statistics Report**: Generated at the end of processing with detailed metrics
-
-To view real-time logs:
-```bash
-tail -f translation_process.log
+# JSON files
+python main.py --config config.yaml --input_file data.json --output_file translated.json
 ```
 
 ## Cache Management
@@ -242,6 +228,8 @@ spark:
 
 3. **Missing Translations**: Ensure your source language detection is working correctly or explicitly specify the source language.
 
+4. **Checkpoint Errors**: If checkpoint files are corrupted, clear the checkpoint directory and restart the process.
+
 ### Debugging
 
 Enable detailed logging for troubleshooting:
@@ -250,6 +238,32 @@ logging:
   level: "DEBUG"
   log_file: "debug.log"
 ```
+
+## Implementation Details
+
+### Caching System
+
+The system implements three different cache backends:
+
+1. **SQLite Cache**: Default option, stores translations in a local SQLite database with WAL journaling for improved performance.
+
+2. **PostgreSQL Cache**: Enterprise option for shared caching across multiple processes or servers.
+
+3. **In-Memory Cache**: Lightweight option for testing or small workloads, does not persist between runs.
+
+### Language Detection
+
+The system includes a basic language detection implementation that can identify common languages based on character frequencies and word patterns. For production use with difficult language pairs, consider using the source_language_column parameter to explicitly specify source languages.
+
+### Translation Process
+
+1. Data is read from the input file and partitioned for parallel processing
+2. For each text column to translate:
+   - The system checks if a cached translation exists
+   - If not cached, text is sent to OpenAI's API for translation
+   - Results are cached to avoid redundant API calls
+3. Translations are added as new columns with "_[target_language]" suffix
+4. Processed data is written to the output file
 
 ## Contributing
 
