@@ -13,7 +13,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from pyspark.sql import SparkSession
 
 from config import ConfigManager
-from modules.io import DataReader, DataWriter
+from modules.file_manager import DataReader, DataWriter
 from modules.translator import TranslationManager
 from modules.cache import CacheManager
 from modules.checkpoint import CheckpointManager
