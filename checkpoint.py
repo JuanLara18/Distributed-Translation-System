@@ -262,3 +262,177 @@ class CheckpointManager:
             return False
             
         return len(self.processed_partitions) > 0
+    
+    def get_checkpoint_state(self) -> Dict[str, Any]:
+        """
+        Get the current checkpoint state information.
+        
+        Returns:
+            Dictionary containing checkpoint state details
+        """
+        if not self.enabled:
+            return {
+                'enabled': False,
+                'processed_count': 0,
+                'state': 'disabled'
+            }
+            
+        return {
+            'enabled': True,
+            'processed_count': len(self.processed_partitions),
+            'processed_partitions': sorted(list(self.processed_partitions)),
+            'checkpoint_directory': self.directory,
+            'interval': self.interval,
+            'max_checkpoints': self.max_checkpoints,
+            'last_updated': int(time.time())
+        }
+    
+    def load_checkpoint_data(self, partition_id: int) -> Optional[DataFrame]:
+        """
+        Load DataFrame data from a specific checkpoint.
+        
+        Args:
+            partition_id: Partition ID to load
+            
+        Returns:
+            DataFrame from checkpoint or None if not found/valid
+        """
+        if not self.enabled or partition_id not in self.processed_partitions:
+            return None
+            
+        checkpoint_path = self.get_checkpoint_path(partition_id)
+        if not os.path.exists(checkpoint_path):
+            self.logger.warning(f"Checkpoint file not found for partition {partition_id} at {checkpoint_path}")
+            return None
+            
+        try:
+            # This requires a SparkSession to be available
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+            
+            df = spark.read.parquet(checkpoint_path)
+            self.logger.info(f"Loaded checkpoint data for partition {partition_id}")
+            return df
+        except Exception as e:
+            self.logger.error(f"Error loading checkpoint data for partition {partition_id}: {str(e)}")
+            return None
+    
+    def save_global_state(self, state: Dict[str, Any]) -> bool:
+        """
+        Save global processing state to a checkpoint file.
+        
+        Args:
+            state: Dictionary containing global state information
+            
+        Returns:
+            Boolean indicating success
+        """
+        if not self.enabled:
+            return False
+            
+        try:
+            # Add timestamp to state
+            state_with_timestamp = {
+                **state,
+                'timestamp': int(time.time()),
+                'processed_partitions': sorted(list(self.processed_partitions))
+            }
+            
+            # Save to state file
+            state_path = os.path.join(self.directory, 'global_state.json')
+            with open(state_path, 'w') as f:
+                json.dump(state_with_timestamp, f, indent=2)
+                
+            self.logger.info("Saved global processing state to checkpoint")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error saving global state: {str(e)}")
+            return False
+    
+    def load_global_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Load global processing state from checkpoint file.
+        
+        Returns:
+            Dictionary containing global state or None if not found/valid
+        """
+        if not self.enabled:
+            return None
+            
+        state_path = os.path.join(self.directory, 'global_state.json')
+        if not os.path.exists(state_path):
+            self.logger.info("No global state checkpoint found")
+            return None
+            
+        try:
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+                
+            self.logger.info("Loaded global processing state from checkpoint")
+            return state
+        except Exception as e:
+            self.logger.error(f"Error loading global state: {str(e)}")
+            return None
+    
+    def get_most_recent_checkpoint_time(self) -> Optional[int]:
+        """
+        Get the timestamp of the most recent checkpoint.
+        
+        Returns:
+            Unix timestamp of the most recent checkpoint or None if no checkpoints exist
+        """
+        if not self.enabled:
+            return None
+            
+        try:
+            # Check metadata file first
+            metadata_path = os.path.join(self.directory, 'checkpoint_metadata.json')
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                    return metadata.get('timestamp')
+            
+            # If no metadata, check modification time of checkpoint files
+            checkpoint_files = glob.glob(os.path.join(self.directory, 'checkpoint_*.parquet'))
+            if not checkpoint_files:
+                return None
+                
+            # Get most recent modification time
+            most_recent = max(os.path.getmtime(f) for f in checkpoint_files)
+            return int(most_recent)
+        except Exception as e:
+            self.logger.error(f"Error getting most recent checkpoint time: {str(e)}")
+            return None
+    
+    def checkpoint_exists(self) -> bool:
+        """
+        Check if any checkpoints exist.
+        
+        Returns:
+            Boolean indicating if checkpoints exist
+        """
+        if not self.enabled:
+            return False
+            
+        metadata_path = os.path.join(self.directory, 'checkpoint_metadata.json')
+        if os.path.exists(metadata_path):
+            return True
+            
+        checkpoint_files = glob.glob(os.path.join(self.directory, 'checkpoint_*.parquet'))
+        return len(checkpoint_files) > 0
+    
+    def is_processing_complete(self, total_partitions: int) -> bool:
+        """
+        Check if processing is complete based on checkpoints.
+        
+        Args:
+            total_partitions: Total number of partitions
+            
+        Returns:
+            Boolean indicating if all partitions have been processed
+        """
+        if not self.enabled:
+            return False
+            
+        # Check if all partition IDs are in processed_partitions
+        return all(partition_id in self.processed_partitions for partition_id in range(total_partitions))
