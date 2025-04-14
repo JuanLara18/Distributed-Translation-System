@@ -6,6 +6,7 @@ Provides common utility functions used across the system.
 """
 
 import os
+import shutil
 import sys
 import time
 import logging
