@@ -12,12 +12,17 @@ from typing import Dict, List, Any, Optional, Tuple, Set
 import logging
 import concurrent.futures
 from functools import partial
+import re
 
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
 from pyspark.sql.types import StringType
 
 from modules.cache import CacheManager
+from modules.utilities import (
+    retry, detect_language, clean_text, 
+    truncate_text, get_normalized_language_code
+)
 
 
 class AbstractTranslator(ABC):
@@ -87,8 +92,18 @@ class OpenAITranslator(AbstractTranslator):
         self.temperature = config.get('openai', {}).get('temperature', 0.1)
         self.max_tokens = config.get('openai', {}).get('max_tokens', 1500)
         self.retry_config = config.get('retry', {})
-        self.client = None  # This would be initialized with the real API client
+        
+        # Initialize OpenAI client
+        try:
+            import openai
+            openai.api_key = self.api_key
+            self.client = openai
+            self.logger.info(f"Initialized OpenAI client with model {self.model}")
+        except ImportError:
+            self.logger.error("Failed to import OpenAI module. Make sure it's installed.")
+            raise
     
+    @retry(max_attempts=3, backoff_factor=2)
     def translate(self, text: str, source_language: str, target_language: str) -> str:
         """
         Translate a text using OpenAI API.
@@ -101,7 +116,52 @@ class OpenAITranslator(AbstractTranslator):
         Returns:
             Translated text
         """
-        pass
+        if not text or not text.strip():
+            return ""
+        
+        # Normalize language codes
+        source_language = get_normalized_language_code(source_language)
+        target_language = get_normalized_language_code(target_language)
+        
+        # Handle auto-detection for source language
+        if source_language == 'auto' or source_language == 'unknown':
+            detected_language = detect_language(text)
+            if detected_language != 'unknown':
+                source_language = detected_language
+                self.logger.debug(f"Auto-detected language as {source_language}")
+            else:
+                source_language = 'en'  # Default to English if detection fails
+                self.logger.warning("Could not detect language, defaulting to English")
+        
+        system_prompt = self._get_system_prompt(source_language, target_language)
+        
+        try:
+            start_time = time.time()
+            
+            # Call OpenAI API using recommended v1 API structure
+            response = self.client.ChatCompletion.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens
+            )
+            
+            translation = response.choices[0].message.content
+            translation = self._clean_translation(translation)
+            
+            elapsed_time = time.time() - start_time
+            self.logger.debug(f"Translation completed in {elapsed_time:.2f}s: {source_language} -> {target_language}, {len(text)} chars")
+            
+            return translation
+            
+        except Exception as e:
+            self.logger.error(f"Translation error: {str(e)}")
+            # For transient errors, let the retry decorator handle it
+            # For persistent errors, return original text as fallback
+            raise
     
     def batch_translate(self, texts: List[str], source_language: str, target_language: str) -> List[str]:
         """
@@ -115,7 +175,63 @@ class OpenAITranslator(AbstractTranslator):
         Returns:
             List of translated texts
         """
-        pass
+        if not texts:
+            return []
+        
+        # Filter out empty texts
+        filtered_texts = [text for text in texts if text and text.strip()]
+        if not filtered_texts:
+            return [""] * len(texts)
+        
+        # Create a mapping of original indices to filtered indices
+        original_to_filtered = {}
+        filtered_index = 0
+        for i, text in enumerate(texts):
+            if text and text.strip():
+                original_to_filtered[i] = filtered_index
+                filtered_index += 1
+        
+        # Normalize language codes
+        source_language = get_normalized_language_code(source_language)
+        target_language = get_normalized_language_code(target_language)
+        
+        # Use ThreadPoolExecutor for parallel processing
+        max_workers = min(len(filtered_texts), os.cpu_count() * 2 or 2)
+        results = [""] * len(texts)
+        
+        translate_func = partial(self.translate, 
+                                source_language=source_language, 
+                                target_language=target_language)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all translation tasks
+            future_to_index = {
+                executor.submit(translate_func, text): i 
+                for i, text in enumerate(filtered_texts)
+            }
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_index):
+                filtered_index = future_to_index[future]
+                
+                try:
+                    translation = future.result()
+                    
+                    # Find all original indices that map to this filtered index
+                    for orig_idx, filt_idx in original_to_filtered.items():
+                        if filt_idx == filtered_index:
+                            results[orig_idx] = translation
+                            
+                except Exception as e:
+                    self.logger.error(f"Error in batch translation: {str(e)}")
+                    # Find original index for error reporting
+                    for orig_idx, filt_idx in original_to_filtered.items():
+                        if filt_idx == filtered_index:
+                            self.logger.error(f"Failed to translate text at index {orig_idx}")
+                            # Use original text as fallback
+                            results[orig_idx] = texts[orig_idx]
+        
+        return results
     
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
@@ -128,7 +244,15 @@ class OpenAITranslator(AbstractTranslator):
         Returns:
             Formatted system prompt
         """
-        pass
+        return (
+            f"You are a professional translator from {source_language} to {target_language}. "
+            f"Translate the following text from {source_language} to {target_language}. "
+            f"Provide only the translated text without explanations, introductions, or notes. "
+            f"Maintain the original formatting, paragraph breaks, and style as much as possible. "
+            f"If there are any idioms, cultural references, or specific terminology, translate them "
+            f"appropriately for the target language and culture. "
+            f"If you're unsure about any specific term, translate it in the most general way possible."
+        )
     
     def _clean_translation(self, text: str) -> str:
         """
@@ -140,7 +264,23 @@ class OpenAITranslator(AbstractTranslator):
         Returns:
             Cleaned text
         """
-        pass
+        if not text:
+            return ""
+            
+        # Remove common artifacts from OpenAI responses
+        
+        # Remove "Translation:" prefixes
+        text = re.sub(r'^(Translation:\s*)', '', text, flags=re.IGNORECASE)
+        
+        # Remove quotes if the entire text is quoted
+        if (text.startswith('"') and text.endswith('"')) or \
+           (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1]
+            
+        # Clean up any extra whitespace
+        text = clean_text(text)
+            
+        return text
 
 
 class TranslationManager:
@@ -185,7 +325,42 @@ class TranslationManager:
         Returns:
             Processed DataFrame with translations added
         """
-        pass
+        if not self.columns_to_translate:
+            self.logger.warning("No columns specified for translation")
+            return df
+            
+        # Create an output dataframe starting with the original data
+        processed_df = df
+        
+        # Register UDF for translation
+        translate_udf = F.udf(self._translate_with_language, StringType())
+        
+        for column in self.columns_to_translate:
+            # Check if column exists
+            if column not in df.columns:
+                self.logger.warning(f"Column '{column}' not found in dataframe, skipping")
+                continue
+                
+            # Generate the output column name
+            output_column = f"{column}_{self.target_language}"
+            
+            # Apply translation UDF
+            if self.source_language_column and self.source_language_column in df.columns:
+                # Use specified source language column
+                self.logger.info(f"Translating column '{column}' using language from '{self.source_language_column}'")
+                processed_df = processed_df.withColumn(
+                    output_column,
+                    translate_udf(F.col(column), F.col(self.source_language_column))
+                )
+            else:
+                # Use auto-detection for source language
+                self.logger.info(f"Translating column '{column}' with auto language detection")
+                processed_df = processed_df.withColumn(
+                    output_column,
+                    translate_udf(F.col(column), F.lit("auto"))
+                )
+        
+        return processed_df
     
     def _translate_with_language(self, text: str, source_language: str) -> str:
         """
@@ -199,7 +374,31 @@ class TranslationManager:
         Returns:
             Translated text
         """
-        pass
+        if not text or not text.strip():
+            return ""
+            
+        try:
+            # Check cache first
+            cached_translation = self.cache_manager.get(text, source_language, self.target_language)
+            if cached_translation:
+                self.stats['cached_hits'] += 1
+                return cached_translation
+                
+            # Not in cache, perform translation
+            translation = self.translator.translate(text, source_language, self.target_language)
+            self.stats['api_calls'] += 1
+            
+            # Save to cache
+            self.cache_manager.set(text, source_language, self.target_language, translation)
+            
+            self.stats['translated_rows'] += 1
+            return translation
+            
+        except Exception as e:
+            self.logger.error(f"Translation error: {str(e)}")
+            self.stats['errors'] += 1
+            # Return original text as fallback on error
+            return text
     
     def apply_translations(self, df: DataFrame) -> DataFrame:
         """
@@ -212,7 +411,43 @@ class TranslationManager:
         Returns:
             DataFrame with translations applied
         """
-        pass
+        if not self.columns_to_translate:
+            return df
+            
+        # Create an output dataframe starting with the original data
+        output_df = df
+        
+        # Define a UDF that only uses the cache (no API calls)
+        def get_cached_translation(text: str, source_language: str) -> str:
+            if not text or not text.strip():
+                return ""
+                
+            cached = self.cache_manager.get(text, source_language, self.target_language)
+            if cached:
+                return cached
+            return text  # Return original if not in cache
+        
+        get_cached_udf = F.udf(get_cached_translation, StringType())
+        
+        # Apply translations from cache
+        for column in self.columns_to_translate:
+            if column not in df.columns:
+                continue
+                
+            output_column = f"{column}_{self.target_language}"
+            
+            if self.source_language_column and self.source_language_column in df.columns:
+                output_df = output_df.withColumn(
+                    output_column,
+                    get_cached_udf(F.col(column), F.col(self.source_language_column))
+                )
+            else:
+                output_df = output_df.withColumn(
+                    output_column,
+                    get_cached_udf(F.col(column), F.lit("auto"))
+                )
+        
+        return output_df
     
     def get_stats(self) -> Dict[str, int]:
         """
@@ -221,4 +456,21 @@ class TranslationManager:
         Returns:
             Dictionary of translation statistics
         """
-        pass
+        # Get cache statistics
+        cache_stats = self.cache_manager.get_stats()
+        
+        # Merge with translation stats
+        merged_stats = {
+            **self.stats,
+            'languages': {
+                'source': cache_stats.get('languages', {}).get('source', []),
+                'target': self.target_language
+            },
+            'cache': {
+                'entries': cache_stats.get('valid_entries', 0),
+                'size_bytes': cache_stats.get('size_bytes', 0),
+                'hit_rate': cache_stats.get('hit_rate', 0) * 100  # Convert to percentage
+            }
+        }
+        
+        return merged_stats
