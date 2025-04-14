@@ -1,0 +1,31 @@
+# Core dependencies
+pyspark>=3.1.2
+pyarrow>=6.0.0
+pandas>=1.3.0
+numpy>=1.20.0
+
+# For Stata file support
+pyreadstat>=1.1.5
+
+# For configuration management
+pyyaml>=6.0
+
+# For OpenAI integration
+openai>=0.27.0
+
+# For robust error handling and retries
+tenacity>=8.0.0
+
+# For concurrent processing
+concurrent-futures>=3.0.5; python_version < '3.7'
+
+# For command line parsing
+argparse>=1.4.0
+
+# For database support (for caching)
+sqlalchemy>=1.4.0
+alembic>=1.7.0
+psycopg2-binary>=2.9.0  # For PostgreSQL support
+
+# For logging and monitoring
+python-json-logger>=2.0.0
