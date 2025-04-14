@@ -1,1345 +1,1113 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cache module for the distributed translation system.
-Handles caching of translations to avoid redundant API calls.
+Utility module for the distributed translation system.
+Provides common utility functions used across the system.
 """
 
 import os
+import sys
 import time
-import json
-import sqlite3
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List, Tuple, Set
 import logging
-import threading
+import json
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple, Union, Callable
+import re
 import hashlib
+import functools
+import traceback
+import uuid
+
+from pyspark.sql import SparkSession, DataFrame
+import pyspark.sql.functions as F
+from pyspark.sql.types import StringType, BooleanType
+import pandas as pd
 
 
-class AbstractCache(ABC):
+def set_up_logging(level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
     """
-    Abstract base class for cache implementations.
+    Set up logging configuration for the application.
+    
+    Args:
+        level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: Path to the log file (if None, logs to console only)
+        
+    Returns:
+        Root logger configured with the specified settings
     """
+    # Map string levels to logging constants
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL
+    }
+    log_level = level_map.get(level.upper(), logging.INFO)
     
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the cache.
-        
-        Args:
-            config: Configuration dictionary
-        """
-        self.config = config
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.ttl = config.get('cache', {}).get('ttl', 2592000)  # Default 30 days in seconds
+    # Clear any existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
     
-    @abstractmethod
-    def get(self, source_text: str, source_language: str, target_language: str) -> Optional[str]:
-        """
-        Get a translation from the cache.
-        
-        Args:
-            source_text: Original text to look up
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Cached translation or None if not found
-        """
-        pass
+    # Configure formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     
-    @abstractmethod
-    def set(self, source_text: str, source_language: str, target_language: str, 
-            translation: str) -> bool:
-        """
-        Store a translation in the cache.
-        
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
-            translation: Translated text to store
-            
-        Returns:
-            Boolean indicating success
-        """
-        pass
+    # Configure console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
     
-    @abstractmethod
-    def batch_get(self, items: List[Tuple[str, str, str]]) -> Dict[Tuple[str, str, str], Optional[str]]:
-        """
-        Get multiple translations from the cache in one operation.
+    # Configure file handler if log file is specified
+    if log_file:
+        # Ensure log directory exists
+        log_dir = os.path.dirname(os.path.abspath(log_file))
+        os.makedirs(log_dir, exist_ok=True)
         
-        Args:
-            items: List of (source_text, source_language, target_language) tuples
-            
-        Returns:
-            Dictionary mapping each input tuple to its cached translation (or None)
-        """
-        pass
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
     
-    @abstractmethod
-    def batch_set(self, translations: Dict[Tuple[str, str, str], str]) -> int:
-        """
-        Store multiple translations in the cache in one operation.
-        
-        Args:
-            translations: Dictionary mapping (source_text, source_language, target_language)
-                          tuples to their translations
-                          
-        Returns:
-            Number of items successfully cached
-        """
-        pass
+    # Set logging level
+    root_logger.setLevel(log_level)
     
-    @abstractmethod
-    def contains(self, source_text: str, source_language: str, target_language: str) -> bool:
-        """
-        Check if a translation exists in the cache.
-        
-        Args:
-            source_text: Original text to check
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Boolean indicating if the translation is cached
-        """
-        pass
-    
-    @abstractmethod
-    def cleanup(self) -> int:
-        """
-        Remove expired entries from the cache.
-        
-        Returns:
-            Number of items removed
-        """
-        pass
-    
-    @abstractmethod
-    def flush(self) -> bool:
-        """
-        Ensure all pending writes are committed to persistent storage.
-        
-        Returns:
-            Boolean indicating success
-        """
-        pass
-    
-    @abstractmethod
-    def clear(self) -> bool:
-        """
-        Clear all entries from the cache.
-        
-        Returns:
-            Boolean indicating success
-        """
-        pass
-    
-    @abstractmethod
-    def stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the cache.
-        
-        Returns:
-            Dictionary with cache statistics
-        """
-        pass
+    # Return the configured logger
+    return root_logger
 
 
-class SQLiteCache(AbstractCache):
+def create_spark_session(app_name: str = "distributed_translation",
+                         config: Optional[Dict[str, Any]] = None) -> SparkSession:
     """
-    SQLite-based implementation of the cache.
-    """
+    Create and configure a Spark session.
     
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the SQLite cache.
+    Args:
+        app_name: Name of the Spark application
+        config: Dictionary of configuration options for Spark
         
-        Args:
-            config: Configuration dictionary
-        """
-        super().__init__(config)
-        self.location = config.get('cache', {}).get('location', './cache/translations.db')
-        self.conn = None
-        self.cursor = None
-        self._initialize_db()
+    Returns:
+        Configured SparkSession
+    """
+    # Default configuration
+    default_config = {
+        "executor_memory": "4g",
+        "driver_memory": "4g",
+        "executor_cores": 2,
+        "default_parallelism": 4
+    }
     
-    def _initialize_db(self) -> None:
-        """
-        Initialize the SQLite database and create needed tables if they don't exist.
-        """
+    # Merge with provided configuration
+    spark_config = {**default_config, **(config or {})}
+    
+    # Build SparkSession
+    builder = SparkSession.builder.appName(app_name)
+    
+    # Set configuration options
+    builder = builder.config("spark.executor.memory", spark_config.get("executor_memory"))
+    builder = builder.config("spark.driver.memory", spark_config.get("driver_memory"))
+    builder = builder.config("spark.executor.cores", spark_config.get("executor_cores"))
+    builder = builder.config("spark.default.parallelism", spark_config.get("default_parallelism"))
+    
+    # Set common Spark configuration for better performance
+    builder = builder.config("spark.sql.adaptive.enabled", "true")
+    builder = builder.config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    builder = builder.config("spark.sql.shuffle.partitions", str(spark_config.get("default_parallelism") * 2))
+    builder = builder.config("spark.driver.extraJavaOptions", "-XX:+UseG1GC")
+    builder = builder.config("spark.executor.extraJavaOptions", "-XX:+UseG1GC")
+    
+    # Create and return the session
+    spark = builder.getOrCreate()
+    
+    # Set log level to ERROR to reduce Spark verbosity
+    spark.sparkContext.setLogLevel("ERROR")
+    
+    # Log Spark configuration
+    logger = logging.getLogger(__name__)
+    logger.info(f"Created Spark session with app_name: {app_name}")
+    logger.info(f"Spark configuration: {spark_config}")
+    
+    return spark
+
+
+def timer(func: Callable) -> Callable:
+    """
+    Decorator to measure execution time of functions.
+    
+    Args:
+        func: Function to be timed
+        
+    Returns:
+        Wrapped function that logs execution time
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        logger = logging.getLogger(func.__module__)
+        start_time = time.time()
+        
         try:
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(os.path.abspath(self.location)), exist_ok=True)
+            result = func(*args, **kwargs)
+            end_time = time.time()
+            elapsed_time = end_time - start_time
             
-            # Connect to the database with WAL journal mode for better concurrency
-            self.conn = sqlite3.connect(self.location, check_same_thread=False, timeout=30.0)
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.cursor = self.conn.cursor()
-            
-            # Create the translations table if it doesn't exist
-            self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS translations (
-                id TEXT PRIMARY KEY,
-                source_text TEXT,
-                source_language TEXT,
-                target_language TEXT,
-                translation TEXT,
-                timestamp INTEGER
-            )
-            ''')
-            
-            # Create indexes for faster lookups
-            self.cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_translation_lookup ON translations 
-            (source_language, target_language, source_text)
-            ''')
-            
-            self.cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON translations (timestamp)
-            ''')
-            
-            self.conn.commit()
-            self.logger.info(f"SQLite cache initialized at {self.location}")
-        except sqlite3.Error as e:
-            self.logger.error(f"Error initializing SQLite database: {str(e)}")
+            logger.info(f"Function '{func.__name__}' executed in {elapsed_time:.2f} seconds")
+            return result
+        except Exception as e:
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            logger.error(f"Function '{func.__name__}' failed after {elapsed_time:.2f} seconds: {str(e)}")
             raise
+            
+    return wrapper
+
+
+def retry(max_attempts: int = 3, backoff_factor: float = 2.0, 
+          exceptions: tuple = (Exception,), logger: Optional[logging.Logger] = None) -> Callable:
+    """
+    Decorator for retrying a function with exponential backoff.
     
-    def _generate_id(self, source_text: str, source_language: str, target_language: str) -> str:
-        """
-        Generate a unique ID for a translation entry.
+    Args:
+        max_attempts: Maximum number of retry attempts
+        backoff_factor: Factor to multiply delay time by on each retry
+        exceptions: Tuple of exceptions to catch and retry
+        logger: Logger to use for logging retries
         
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
+    Returns:
+        Wrapped function with retry logic
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            local_logger = logger or logging.getLogger(func.__module__)
+            attempt = 0
+            delay = 1
             
-        Returns:
-            Unique ID string
-        """
-        key = f"{source_language}:{target_language}:{source_text}"
-        return hashlib.md5(key.encode('utf-8')).hexdigest()
-    
-    def get(self, source_text: str, source_language: str, target_language: str) -> Optional[str]:
-        """
-        Get a translation from the cache.
-        
-        Args:
-            source_text: Original text to look up
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Cached translation or None if not found
-        """
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            entry_id = self._generate_id(source_text, source_language, target_language)
-            
-            self.cursor.execute(
-                '''
-                SELECT translation FROM translations 
-                WHERE id = ? AND timestamp > ?
-                ''',
-                (entry_id, expiry_time)
-            )
-            
-            result = self.cursor.fetchone()
-            if result:
-                return result[0]
-            return None
-        except sqlite3.Error as e:
-            self.logger.error(f"Error retrieving from cache: {str(e)}")
-            return None
-    
-    def set(self, source_text: str, source_language: str, target_language: str, 
-            translation: str) -> bool:
-        """
-        Store a translation in the cache.
-        
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
-            translation: Translated text to store
-            
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            current_time = int(time.time())
-            entry_id = self._generate_id(source_text, source_language, target_language)
-            
-            self.cursor.execute(
-                '''
-                INSERT OR REPLACE INTO translations 
-                (id, source_text, source_language, target_language, translation, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''',
-                (entry_id, source_text, source_language, target_language, translation, current_time)
-            )
-            
-            self.conn.commit()
-            return True
-        except sqlite3.Error as e:
-            self.logger.error(f"Error setting cache: {str(e)}")
-            return False
-    
-    def batch_get(self, items: List[Tuple[str, str, str]]) -> Dict[Tuple[str, str, str], Optional[str]]:
-        """
-        Get multiple translations from the cache in one operation.
-        
-        Args:
-            items: List of (source_text, source_language, target_language) tuples
-            
-        Returns:
-            Dictionary mapping each input tuple to its cached translation (or None)
-        """
-        results = {}
-        if not items:
-            return results
-            
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            
-            # Generate IDs for all items
-            ids = [self._generate_id(text, src_lang, tgt_lang) for text, src_lang, tgt_lang in items]
-            
-            # Build a parameterized query with placeholders
-            placeholders = ','.join(['?'] * len(ids))
-            query = f'''
-            SELECT id, translation 
-            FROM translations 
-            WHERE id IN ({placeholders})
-            AND timestamp > ?
-            '''
-            
-            # Execute query with all IDs and expiry time
-            params = ids + [expiry_time]
-            self.cursor.execute(query, params)
-            
-            # Create a mapping from ID to translation
-            id_to_translation = {row[0]: row[1] for row in self.cursor.fetchall()}
-            
-            # Map each input item to its translation (or None)
-            for i, (text, src_lang, tgt_lang) in enumerate(items):
-                entry_id = ids[i]
-                results[(text, src_lang, tgt_lang)] = id_to_translation.get(entry_id)
+            while attempt < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    attempt += 1
+                    if attempt >= max_attempts:
+                        local_logger.error(
+                            f"Function '{func.__name__}' failed after {max_attempts} attempts: {str(e)}"
+                        )
+                        raise
                     
-            return results
-        except sqlite3.Error as e:
-            self.logger.error(f"Error in batch get: {str(e)}")
-            # Return None for all items on error
-            return {item: None for item in items}
+                    # Calculate backoff delay
+                    wait_time = delay * (backoff_factor ** (attempt - 1))
+                    local_logger.warning(
+                        f"Retry {attempt}/{max_attempts} for function '{func.__name__}' "
+                        f"after {wait_time:.2f}s due to: {str(e)}"
+                    )
+                    
+                    # Sleep with the calculated delay
+                    time.sleep(wait_time)
+            
+            # This should never be reached
+            return None
+            
+        return wrapper
+    return decorator
+
+
+def detect_language(text: str) -> str:
+    """
+    Detect the language of a given text.
+    This is a simple implementation that relies on character frequency patterns.
+    For production use, consider using a more robust language detection library.
     
-    def batch_set(self, translations: Dict[Tuple[str, str, str], str]) -> int:
-        """
-        Store multiple translations in the cache in one operation.
+    Args:
+        text: Text to analyze
         
-        Args:
-            translations: Dictionary mapping (source_text, source_language, target_language)
-                          tuples to their translations
-                          
-        Returns:
-            Number of items successfully cached
-        """
-        if not translations:
-            return 0
+    Returns:
+        ISO 639-1 language code (2-letter) or 'unknown'
+    """
+    if not text or len(text.strip()) < 10:
+        return 'unknown'
+    
+    # Simplified language detection based on character frequency
+    # Real implementation would use a proper language detection library
+    
+    # Normalize text
+    text = text.lower()
+    
+    # Define character sets for different language groups
+    lang_chars = {
+        'en': set('abcdefghijklmnopqrstuvwxyz'),
+        'es': set('abcdefghijklmnñopqrstuvwxyzáéíóúü'),
+        'fr': set('abcdefghijklmnopqrstuvwxyzàâæçéèêëîïôœùûüÿ'),
+        'de': set('abcdefghijklmnopqrstuvwxyzäöüß'),
+        'it': set('abcdefghijklmnopqrstuvwxyzàèéìíîòóùú'),
+        'pt': set('abcdefghijklmnopqrstuvwxyzáàâãçéêíóôõú'),
+        'ru': set('абвгдеёжзийклмнопрстуфхцчшщъыьэюя'),
+        'zh': set(),  # Chinese would need a different approach
+        'ja': set(),  # Japanese would need a different approach
+        'ar': set('ابتثجحخدذرزسشصضطظعغفقكلمنهوي')
+    }
+    
+    # Common word patterns in different languages
+    lang_patterns = {
+        'en': [r'\bthe\b', r'\band\b', r'\bof\b', r'\bto\b', r'\ba\b', r'\bin\b', r'\bis\b'],
+        'es': [r'\bel\b', r'\bla\b', r'\bde\b', r'\ben\b', r'\by\b', r'\bque\b', r'\bun\b'],
+        'fr': [r'\ble\b', r'\bla\b', r'\bde\b', r'\bet\b', r'\ben\b', r'\bun\b', r'\best\b'],
+        'de': [r'\bder\b', r'\bdie\b', r'\bdas\b', r'\bin\b', r'\bund\b', r'\bist\b', r'\bzu\b'],
+        'it': [r'\bil\b', r'\bla\b', r'\bdi\b', r'\be\b', r'\bin\b', r'\bche\b', r'\bun\b'],
+        'pt': [r'\bo\b', r'\ba\b', r'\bde\b', r'\be\b', r'\bem\b', r'\bque\b', r'\bum\b'],
+        'ru': [r'\bи\b', r'\bв\b', r'\bна\b', r'\bс\b', r'\bне\b', r'\bчто\b', r'\bэто\b'],
+        'zh': [],  # Would need a different approach
+        'ja': [],  # Would need a different approach
+        'ar': [r'\bفي\b', r'\bمن\b', r'\bإلى\b', r'\bعلى\b', r'\bأن\b', r'\bهذا\b', r'\bمع\b']
+    }
+    
+    # Count character matches for each language
+    char_scores = {}
+    for lang, charset in lang_chars.items():
+        if not charset:  # Skip languages with empty character sets
+            continue
+        
+        # Count matching characters
+        matches = sum(1 for char in text if char in charset)
+        total_chars = sum(1 for char in text if char.isalpha())
+        
+        # Calculate score as a percentage of matching characters
+        if total_chars > 0:
+            char_scores[lang] = matches / total_chars
+    
+    # Check word patterns
+    pattern_scores = {}
+    for lang, patterns in lang_patterns.items():
+        if not patterns:  # Skip languages with no patterns
+            continue
+        
+        # Count matching patterns
+        matches = sum(1 for pattern in patterns if re.search(pattern, text))
+        pattern_scores[lang] = matches / len(patterns) if patterns else 0
+    
+    # Combine scores
+    combined_scores = {}
+    for lang in set(char_scores.keys()) | set(pattern_scores.keys()):
+        char_weight = 0.7
+        pattern_weight = 0.3
+        
+        char_score = char_scores.get(lang, 0)
+        pattern_score = pattern_scores.get(lang, 0)
+        
+        combined_scores[lang] = (char_score * char_weight) + (pattern_score * pattern_weight)
+    
+    # Return the language with the highest score, or 'unknown' if no good match
+    if combined_scores:
+        best_lang = max(combined_scores.items(), key=lambda x: x[1])
+        return best_lang[0] if best_lang[1] > 0.5 else 'unknown'
+    
+    return 'unknown'
+
+
+def create_udf_detect_language() -> F.udf:
+    """
+    Create a Spark UDF for language detection.
+    
+    Returns:
+        Spark UDF for language detection
+    """
+    return F.udf(detect_language, StringType())
+
+
+def batch_dataframe(df: DataFrame, batch_size: int) -> List[DataFrame]:
+    """
+    Split a DataFrame into batches for easier processing.
+    
+    Args:
+        df: DataFrame to split
+        batch_size: Number of rows per batch
+        
+    Returns:
+        List of DataFrame batches
+    """
+    # Add row number column
+    df_with_index = df.withColumn("_row_num", F.monotonically_increasing_id())
+    
+    # Get total count
+    total_rows = df.count()
+    
+    # Calculate number of batches
+    num_batches = (total_rows + batch_size - 1) // batch_size
+    
+    # Create and return batches
+    batches = []
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = (i + 1) * batch_size - 1
+        
+        batch = df_with_index.filter(
+            (F.col("_row_num") >= start_idx) & 
+            (F.col("_row_num") <= end_idx)
+        ).drop("_row_num")
+        
+        batches.append(batch)
+    
+    return batches
+
+
+def text_to_batches(texts: List[str], batch_size: int) -> List[List[str]]:
+    """
+    Split a list of texts into batches for efficient processing.
+    
+    Args:
+        texts: List of text strings to split
+        batch_size: Maximum number of texts per batch
+        
+    Returns:
+        List of text batches
+    """
+    return [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+
+
+def clean_text(text: str) -> str:
+    """
+    Clean text by removing excessive whitespace and normalizing line endings.
+    
+    Args:
+        text: Text to clean
+        
+    Returns:
+        Cleaned text
+    """
+    if not text:
+        return ""
+    
+    # Replace multiple spaces with a single space
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Normalize line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+    # Trim leading/trailing whitespace
+    text = text.strip()
+    
+    return text
+
+
+def truncate_text(text: str, max_length: int = 500, add_ellipsis: bool = True) -> str:
+    """
+    Truncate text to a maximum length, optionally adding an ellipsis.
+    
+    Args:
+        text: Text to truncate
+        max_length: Maximum length in characters
+        add_ellipsis: Whether to add an ellipsis (...) for truncated text
+        
+    Returns:
+        Truncated text
+    """
+    if not text or len(text) <= max_length:
+        return text
+    
+    # Truncate to max_length
+    truncated = text[:max_length]
+    
+    # Add ellipsis if requested
+    if add_ellipsis:
+        truncated += "..."
+    
+    return truncated
+
+
+def format_time_elapsed(seconds: float) -> str:
+    """
+    Format elapsed time in a human-readable format.
+    
+    Args:
+        seconds: Number of seconds
+        
+    Returns:
+        Formatted time string (e.g., "2h 30m 45s")
+    """
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
+
+def format_file_size(size_bytes: int) -> str:
+    """
+    Format file size in a human-readable format.
+    
+    Args:
+        size_bytes: Size in bytes
+        
+    Returns:
+        Formatted size string (e.g., "2.5 MB")
+    """
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024 or unit == 'TB':
+            if unit == 'B':
+                return f"{size_bytes} {unit}"
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+
+
+def is_valid_language_code(code: str) -> bool:
+    """
+    Check if a string is a valid ISO 639-1 language code.
+    
+    Args:
+        code: Language code to check
+        
+    Returns:
+        Boolean indicating if code is valid
+    """
+    # Common ISO 639-1 language codes
+    valid_codes = {
+        'aa', 'ab', 'ae', 'af', 'ak', 'am', 'an', 'ar', 'as', 'av', 'ay', 'az',
+        'ba', 'be', 'bg', 'bh', 'bi', 'bm', 'bn', 'bo', 'br', 'bs',
+        'ca', 'ce', 'ch', 'co', 'cr', 'cs', 'cu', 'cv', 'cy',
+        'da', 'de', 'dv', 'dz',
+        'ee', 'el', 'en', 'eo', 'es', 'et', 'eu',
+        'fa', 'ff', 'fi', 'fj', 'fo', 'fr', 'fy',
+        'ga', 'gd', 'gl', 'gn', 'gu', 'gv',
+        'ha', 'he', 'hi', 'ho', 'hr', 'ht', 'hu', 'hy', 'hz',
+        'ia', 'id', 'ie', 'ig', 'ii', 'ik', 'io', 'is', 'it', 'iu',
+        'ja', 'jv',
+        'ka', 'kg', 'ki', 'kj', 'kk', 'kl', 'km', 'kn', 'ko', 'kr', 'ks', 'ku', 'kv', 'kw', 'ky',
+        'la', 'lb', 'lg', 'li', 'ln', 'lo', 'lt', 'lu', 'lv',
+        'mg', 'mh', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt', 'my',
+        'na', 'nb', 'nd', 'ne', 'ng', 'nl', 'nn', 'no', 'nr', 'nv', 'ny',
+        'oc', 'oj', 'om', 'or', 'os',
+        'pa', 'pi', 'pl', 'ps', 'pt',
+        'qu',
+        'rm', 'rn', 'ro', 'ru', 'rw',
+        'sa', 'sc', 'sd', 'se', 'sg', 'si', 'sk', 'sl', 'sm', 'sn', 'so', 'sq', 'sr', 'ss', 'st', 'su', 'sv', 'sw',
+        'ta', 'te', 'tg', 'th', 'ti', 'tk', 'tl', 'tn', 'to', 'tr', 'ts', 'tt', 'tw', 'ty',
+        'ug', 'uk', 'ur', 'uz',
+        've', 'vi', 'vo',
+        'wa', 'wo',
+        'xh',
+        'yi', 'yo',
+        'za', 'zh', 'zu'
+    }
+    
+    return code.lower() in valid_codes
+
+
+def get_normalized_language_code(code: str) -> str:
+    """
+    Normalize a language code or name to a standard ISO 639-1 code.
+    
+    Args:
+        code: Language code or name to normalize
+        
+    Returns:
+        Normalized ISO 639-1 language code, or the original if not recognized
+    """
+    # Map of common language names and variations to ISO 639-1 codes
+    language_map = {
+        # English variations
+        'english': 'en',
+        'eng': 'en',
+        'en-us': 'en',
+        'en-gb': 'en',
+        'en-uk': 'en',
+        
+        # Spanish variations
+        'spanish': 'es',
+        'español': 'es',
+        'espanol': 'es',
+        'spa': 'es',
+        'es-es': 'es',
+        'es-mx': 'es',
+        'es-ar': 'es',
+        
+        # French variations
+        'french': 'fr',
+        'français': 'fr',
+        'francais': 'fr',
+        'fra': 'fr',
+        'fre': 'fr',
+        'fr-fr': 'fr',
+        'fr-ca': 'fr',
+        
+        # German variations
+        'german': 'de',
+        'deutsch': 'de',
+        'ger': 'de',
+        'deu': 'de',
+        'de-de': 'de',
+        'de-at': 'de',
+        'de-ch': 'de',
+        
+        # Chinese variations
+        'chinese': 'zh',
+        'mandarin': 'zh',
+        'cantonese': 'zh',
+        'chi': 'zh',
+        'zho': 'zh',
+        'zh-cn': 'zh',
+        'zh-tw': 'zh',
+        'zh-hk': 'zh',
+        
+        # Japanese variations
+        'japanese': 'ja',
+        'jpn': 'ja',
+        'ja-jp': 'ja',
+        
+        # Russian variations
+        'russian': 'ru',
+        'русский': 'ru',
+        'rus': 'ru',
+        'ru-ru': 'ru',
+        
+        # Arabic variations
+        'arabic': 'ar',
+        'العربية': 'ar',
+        'ara': 'ar',
+        'ar-sa': 'ar',
+        
+        # Portuguese variations
+        'portuguese': 'pt',
+        'português': 'pt',
+        'portugues': 'pt',
+        'por': 'pt',
+        'pt-pt': 'pt',
+        'pt-br': 'pt',
+        
+        # Italian variations
+        'italian': 'it',
+        'italiano': 'it',
+        'ita': 'it',
+        'it-it': 'it',
+        
+        # Hindi variations
+        'hindi': 'hi',
+        'हिन्दी': 'hi',
+        'hin': 'hi',
+        'hi-in': 'hi',
+        
+        # Korean variations
+        'korean': 'ko',
+        '한국어': 'ko',
+        'kor': 'ko',
+        'ko-kr': 'ko',
+        
+        # Dutch variations
+        'dutch': 'nl',
+        'nederlands': 'nl',
+        'nld': 'nl',
+        'dut': 'nl',
+        'nl-nl': 'nl',
+        'nl-be': 'nl',
+        
+        # Polish variations
+        'polish': 'pl',
+        'polski': 'pl',
+        'pol': 'pl',
+        'pl-pl': 'pl',
+        
+        # Turkish variations
+        'turkish': 'tr',
+        'türkçe': 'tr',
+        'turkce': 'tr',
+        'tur': 'tr',
+        'tr-tr': 'tr',
+        
+        # Swedish variations
+        'swedish': 'sv',
+        'svenska': 'sv',
+        'swe': 'sv',
+        'sv-se': 'sv',
+        
+        # Greek variations
+        'greek': 'el',
+        'ελληνικά': 'el',
+        'ell': 'el',
+        'gre': 'el',
+        'el-gr': 'el',
+        
+        # Hebrew variations
+        'hebrew': 'he',
+        'עברית': 'he',
+        'heb': 'he',
+        'he-il': 'he',
+        
+        # Vietnamese variations
+        'vietnamese': 'vi',
+        'tiếng việt': 'vi',
+        'tieng viet': 'vi',
+        'vie': 'vi',
+        'vi-vn': 'vi',
+        
+        # Indonesian variations
+        'indonesian': 'id',
+        'bahasa indonesia': 'id',
+        'ind': 'id',
+        'id-id': 'id',
+        
+        # Unknown language fallback
+        'unknown': 'unknown',
+        'unk': 'unknown',
+        'undefined': 'unknown',
+        'other': 'unknown'
+    }
+    
+    # If already a valid 2-letter code, return as is
+    if len(code) == 2 and is_valid_language_code(code):
+        return code.lower()
+    
+    # Normalize the input
+    normalized = code.lower().strip()
+    
+    # Look up in the map
+    return language_map.get(normalized, code)
+
+
+def get_default_source_language() -> str:
+    """
+    Get the default source language to use when none is specified.
+    
+    Returns:
+        Default source language code ('auto' for automatic detection)
+    """
+    return 'auto'
+
+
+def generate_unique_id() -> str:
+    """
+    Generate a unique identifier for tracking processing.
+    
+    Returns:
+        Unique identifier string
+    """
+    return str(uuid.uuid4())
+
+
+def format_stats_report(stats: Dict[str, Any]) -> str:
+    """
+    Format a statistics report in a human-readable format.
+    
+    Args:
+        stats: Dictionary containing statistics
+        
+    Returns:
+        Formatted statistics report
+    """
+    report = [
+        "===== Translation Process Statistics =====",
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    ]
+    
+    # Process timing stats
+    if 'start_time' in stats and 'end_time' in stats:
+        start_time = stats.get('start_time')
+        end_time = stats.get('end_time')
+        if start_time and end_time:
+            elapsed_seconds = end_time - start_time
+            report.append(f"\nExecution Time: {format_time_elapsed(elapsed_seconds)}")
+    
+    # Process row counts
+    report.append("\n--- Row Counts ---")
+    if 'total_rows' in stats:
+        report.append(f"Total Rows: {stats['total_rows']:,}")
+    if 'translated_rows' in stats:
+        report.append(f"Translated Rows: {stats['translated_rows']:,}")
+    
+    # Process API and cache stats
+    report.append("\n--- API & Cache Statistics ---")
+    if 'api_calls' in stats:
+        report.append(f"Total API Calls: {stats['api_calls']:,}")
+    if 'cached_hits' in stats:
+        report.append(f"Cache Hits: {stats['cached_hits']:,}")
+    
+    # Calculate cache hit rate
+    if 'cached_hits' in stats and 'api_calls' in stats:
+        total_requests = stats['cached_hits'] + stats['api_calls']
+        if total_requests > 0:
+            hit_rate = stats['cached_hits'] / total_requests * 100
+            report.append(f"Cache Hit Rate: {hit_rate:.2f}%")
+    
+    # Process error stats
+    if 'errors' in stats:
+        report.append(f"\nErrors: {stats['errors']:,}")
+    
+    # Process cache details if available
+    if 'cache' in stats:
+        cache_stats = stats['cache']
+        report.append("\n--- Cache Details ---")
+        if 'total_entries' in cache_stats:
+            report.append(f"Total Cache Entries: {cache_stats['total_entries']:,}")
+        if 'size_bytes' in cache_stats:
+            report.append(f"Cache Size: {format_file_size(cache_stats['size_bytes'])}")
+    
+    # Process language stats if available
+    if 'languages' in stats:
+        lang_stats = stats['languages']
+        report.append("\n--- Language Statistics ---")
+        if 'source' in lang_stats:
+            source_langs = lang_stats['source']
+            if source_langs:
+                report.append(f"Source Languages: {', '.join(source_langs)}")
+        if 'target' in lang_stats:
+            report.append(f"Target Language: {lang_stats.get('target', 'unknown')}")
+    
+    # Process performance metrics if available
+    if 'performance' in stats:
+        perf_stats = stats['performance']
+        report.append("\n--- Performance Metrics ---")
+        if 'avg_translation_time' in perf_stats:
+            report.append(f"Average Translation Time: {perf_stats['avg_translation_time']:.2f} seconds")
+        if 'texts_per_second' in perf_stats:
+            report.append(f"Processing Rate: {perf_stats['texts_per_second']:.2f} texts/second")
+    
+    report.append("\n=========================================")
+    
+    return "\n".join(report)
+
+
+def save_stats_to_file(stats: Dict[str, Any], filepath: str) -> None:
+    """
+    Save statistics to a JSON file.
+    
+    Args:
+        stats: Dictionary containing statistics
+        filepath: Path to the output file
+    """
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    
+    # Add timestamp if not present
+    if 'timestamp' not in stats:
+        stats['timestamp'] = datetime.now().isoformat()
+    
+    # Save to file
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, indent=2)
+
+
+def load_stats_from_file(filepath: str) -> Dict[str, Any]:
+    """
+    Load statistics from a JSON file.
+    
+    Args:
+        filepath: Path to the input file
+        
+    Returns:
+        Dictionary containing statistics
+    """
+    if not os.path.exists(filepath):
+        return {}
+        
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            stats = json.load(f)
+        return stats
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error loading stats from {filepath}: {str(e)}")
+        return {}
+
+
+def merge_stats(stats1: Dict[str, Any], stats2: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge two statistics dictionaries, summing numeric values and merging lists and dicts.
+    
+    Args:
+        stats1: First statistics dictionary
+        stats2: Second statistics dictionary
+        
+    Returns:
+        Merged statistics dictionary
+    """
+    if not stats1:
+        return stats2.copy() if stats2 else {}
+    if not stats2:
+        return stats1.copy()
+        
+    result = stats1.copy()
+    
+    for key, value in stats2.items():
+        if key not in result:
+            result[key] = value
+        elif isinstance(value, (int, float)) and isinstance(result[key], (int, float)):
+            # Sum numeric values
+            result[key] += value
+        elif isinstance(value, list) and isinstance(result[key], list):
+            # Merge lists (unique values)
+            result[key] = list(set(result[key] + value))
+        elif isinstance(value, dict) and isinstance(result[key], dict):
+            # Recursively merge dictionaries
+            result[key] = merge_stats(result[key], value)
+    
+    return result
+
+
+def calculate_partition_sizes(total_size: int, num_partitions: int) -> List[int]:
+    """
+    Calculate balanced partition sizes for processing.
+    
+    Args:
+        total_size: Total number of items to process
+        num_partitions: Number of partitions to create
+        
+    Returns:
+        List of partition sizes
+    """
+    base_size = total_size // num_partitions
+    remainder = total_size % num_partitions
+    
+    # Distribute the remainder among the first 'remainder' partitions
+    sizes = [base_size + 1 if i < remainder else base_size 
+             for i in range(num_partitions)]
+    
+    return sizes
+
+
+def estimate_completion_time(processed: int, total: int, elapsed_seconds: float) -> float:
+    """
+    Estimate remaining time to complete processing.
+    
+    Args:
+        processed: Number of items processed so far
+        total: Total number of items to process
+        elapsed_seconds: Time elapsed so far in seconds
+        
+    Returns:
+        Estimated remaining time in seconds, or -1 if cannot be estimated
+    """
+    if processed <= 0 or elapsed_seconds <= 0:
+        return -1
+    
+    items_per_second = processed / elapsed_seconds
+    remaining_items = total - processed
+    
+    if items_per_second > 0:
+        return remaining_items / items_per_second
+    
+    return -1
+
+
+def log_progress_bar(current: int, total: int, prefix: str = '', suffix: str = '', 
+                    length: int = 50, fill: str = '█', logger: Optional[logging.Logger] = None) -> None:
+    """
+    Print a progress bar to the logger.
+    
+    Args:
+        current: Current progress value
+        total: Total value
+        prefix: String before the progress bar
+        suffix: String after the progress bar
+        length: Length of the progress bar in characters
+        fill: Character to use for the progress bar
+        logger: Logger to use, or None to use print()
+    """
+    percent = min(100.0, (current / total) * 100) if total > 0 else 0
+    filled_length = int(length * current // total) if total > 0 else 0
+    bar = fill * filled_length + '-' * (length - filled_length)
+    progress_str = f'\r{prefix} |{bar}| {percent:.1f}% {suffix}'
+    
+    if logger:
+        logger.info(progress_str)
+    else:
+        print(progress_str, end='', file=sys.stdout)
+        if current >= total:
+            print(file=sys.stdout)
+        sys.stdout.flush()
+
+
+def create_udf_truncate_text(max_length: int = 500) -> F.udf:
+    """
+    Create a Spark UDF for truncating text.
+    
+    Args:
+        max_length: Maximum length for the truncated text
+        
+    Returns:
+        Spark UDF for text truncation
+    """
+    return F.udf(lambda text: truncate_text(text, max_length), StringType())
+
+
+def create_udf_clean_text() -> F.udf:
+    """
+    Create a Spark UDF for cleaning text.
+    
+    Returns:
+        Spark UDF for text cleaning
+    """
+    return F.udf(clean_text, StringType())
+
+
+def create_udf_is_valid_language() -> F.udf:
+    """
+    Create a Spark UDF for validating language codes.
+    
+    Returns:
+        Spark UDF for language code validation
+    """
+    return F.udf(is_valid_language_code, BooleanType())
+
+
+def get_memory_usage() -> Dict[str, Any]:
+    """
+    Get current memory usage statistics.
+    
+    Returns:
+        Dictionary with memory usage information
+    """
+    import psutil
+    
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    
+    return {
+        'rss_bytes': memory_info.rss,
+        'rss_human': format_file_size(memory_info.rss),
+        'vms_bytes': memory_info.vms,
+        'vms_human': format_file_size(memory_info.vms),
+        'percent': process.memory_percent(),
+        'available_system_memory': format_file_size(psutil.virtual_memory().available)
+    }
+
+
+def setup_temp_directory(base_dir: str = './temp') -> str:
+    """
+    Set up a temporary directory for processing artifacts.
+    
+    Args:
+        base_dir: Base directory for temporary files
+        
+    Returns:
+        Path to the created temporary directory
+    """
+    import tempfile
+    
+    # Ensure base directory exists
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # Create a unique subdirectory
+    temp_dir = tempfile.mkdtemp(prefix='translation_', dir=base_dir)
+    
+    return temp_dir
+
+
+def cleanup_temp_directory(temp_dir: str) -> None:
+    """
+    Clean up a temporary directory.
+    
+    Args:
+        temp_dir: Path to the temporary directory to clean up
+    """
+    try:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to clean up temporary directory {temp_dir}: {str(e)}")
+
+
+def safe_file_write(data: str, filepath: str) -> bool:
+    """
+    Safely write data to a file using a temporary file to prevent corruption.
+    
+    Args:
+        data: Data to write
+        filepath: Target file path
+        
+    Returns:
+        Boolean indicating success
+    """
+    dir_path = os.path.dirname(os.path.abspath(filepath))
+    
+    # Create directory if it doesn't exist
+    os.makedirs(dir_path, exist_ok=True)
+    
+    # Use a temporary file for atomic write
+    temp_file = f"{filepath}.tmp.{os.getpid()}"
+    
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            f.write(data)
+        
+        # On Windows, we need to remove the destination file first
+        if os.name == 'nt' and os.path.exists(filepath):
+            os.remove(filepath)
             
-        try:
-            current_time = int(time.time())
-            
-            # Begin a transaction for efficiency
-            self.conn.execute("BEGIN TRANSACTION")
-            
-            count = 0
-            for (source_text, source_language, target_language), translation in translations.items():
-                entry_id = self._generate_id(source_text, source_language, target_language)
-                self.cursor.execute(
-                    '''
-                    INSERT OR REPLACE INTO translations 
-                    (id, source_text, source_language, target_language, translation, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ''',
-                    (entry_id, source_text, source_language, target_language, translation, current_time)
-                )
-                count += 1
-            
-            # Commit the transaction
-            self.conn.commit()
-            return count
-        except sqlite3.Error as e:
-            self.logger.error(f"Error in batch set: {str(e)}")
-            # Rollback on error
+        # Rename the temporary file to the target filename (atomic on most systems)
+        os.rename(temp_file, filepath)
+        return True
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error writing to file {filepath}: {str(e)}")
+        
+        # Clean up the temporary file
+        if os.path.exists(temp_file):
             try:
-                self.conn.rollback()
+                os.remove(temp_file)
             except:
                 pass
-            return 0
-    
-    def contains(self, source_text: str, source_language: str, target_language: str) -> bool:
-        """
-        Check if a translation exists in the cache.
         
-        Args:
-            source_text: Original text to check
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Boolean indicating if the translation is cached
-        """
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            entry_id = self._generate_id(source_text, source_language, target_language)
-            
-            self.cursor.execute(
-                '''
-                SELECT 1 FROM translations 
-                WHERE id = ? AND timestamp > ?
-                LIMIT 1
-                ''',
-                (entry_id, expiry_time)
-            )
-            
-            return self.cursor.fetchone() is not None
-        except sqlite3.Error as e:
-            self.logger.error(f"Error checking cache: {str(e)}")
-            return False
-    
-    def cleanup(self) -> int:
-        """
-        Remove expired entries from the cache.
-        
-        Returns:
-            Number of items removed
-        """
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            
-            self.cursor.execute(
-                "DELETE FROM translations WHERE timestamp <= ?",
-                (expiry_time,)
-            )
-            
-            count = self.cursor.rowcount
-            self.conn.commit()
-            self.logger.info(f"Removed {count} expired cache entries")
-            return count
-        except sqlite3.Error as e:
-            self.logger.error(f"Error cleaning up cache: {str(e)}")
-            return 0
-    
-    def flush(self) -> bool:
-        """
-        Ensure all pending writes are committed to persistent storage.
-        
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            self.conn.commit()
-            return True
-        except sqlite3.Error as e:
-            self.logger.error(f"Error flushing cache: {str(e)}")
-            return False
-    
-    def clear(self) -> bool:
-        """
-        Clear all entries from the cache.
-        
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            self.cursor.execute("DELETE FROM translations")
-            self.conn.commit()
-            self.logger.info("Cache cleared")
-            return True
-        except sqlite3.Error as e:
-            self.logger.error(f"Error clearing cache: {str(e)}")
-            return False
-    
-    def stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the cache.
-        
-        Returns:
-            Dictionary with cache statistics
-        """
-        stats = {
-            'total_entries': 0,
-            'valid_entries': 0,
-            'expired_entries': 0,
-            'size_bytes': 0,
-            'languages': {
-                'source': [],
-                'target': []
-            }
-        }
-        
-        try:
-            # Get total entries
-            self.cursor.execute("SELECT COUNT(*) FROM translations")
-            stats['total_entries'] = self.cursor.fetchone()[0]
-            
-            # Get valid entries
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            
-            self.cursor.execute(
-                "SELECT COUNT(*) FROM translations WHERE timestamp > ?",
-                (expiry_time,)
-            )
-            stats['valid_entries'] = self.cursor.fetchone()[0]
-            
-            # Calculate expired entries
-            stats['expired_entries'] = stats['total_entries'] - stats['valid_entries']
-            
-            # Get languages
-            self.cursor.execute(
-                "SELECT DISTINCT source_language, target_language FROM translations"
-            )
-            language_pairs = self.cursor.fetchall()
-            source_languages = {lang[0] for lang in language_pairs}
-            target_languages = {lang[1] for lang in language_pairs}
-            stats['languages'] = {
-                'source': list(source_languages),
-                'target': list(target_languages)
-            }
-            
-            # Estimate size
-            self.cursor.execute(
-                "SELECT SUM(LENGTH(source_text)) + SUM(LENGTH(translation)) FROM translations"
-            )
-            size_result = self.cursor.fetchone()
-            if size_result and size_result[0]:
-                stats['size_bytes'] = size_result[0]
-            
-            return stats
-        except sqlite3.Error as e:
-            self.logger.error(f"Error getting cache stats: {str(e)}")
-            return stats
-    
-    def __del__(self):
-        """
-        Destructor to ensure proper cleanup of database connections.
-        """
-        try:
-            if self.conn:
-                self.conn.close()
-        except:
-            pass
+        return False
 
 
-class PostgresCache(AbstractCache):
+def join_path(*paths: str) -> str:
     """
-    PostgreSQL-based implementation of the cache.
+    Join path components in a platform-independent way.
+    
+    Args:
+        *paths: Path components to join
+        
+    Returns:
+        Joined path
     """
-    
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the PostgreSQL cache.
-        
-        Args:
-            config: Configuration dictionary
-        """
-        super().__init__(config)
-        self.connection_string = config.get('cache', {}).get('connection_string')
-        if not self.connection_string:
-            raise ValueError("PostgreSQL connection string not provided in config")
-        
-        # Import psycopg2 here to avoid dependency if not used
-        try:
-            import psycopg2
-            import psycopg2.extras
-            self.psycopg2 = psycopg2
-        except ImportError:
-            self.logger.error("psycopg2 not installed. Run: pip install psycopg2-binary")
-            raise
-            
-        self.conn = None
-        self.cursor = None
-        self._initialize_db()
-    
-    def _initialize_db(self) -> None:
-        """
-        Initialize the PostgreSQL database and create needed tables if they don't exist.
-        """
-        try:
-            self.conn = self.psycopg2.connect(self.connection_string)
-            self.cursor = self.conn.cursor()
-            
-            # Create the translations table if it doesn't exist
-            self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS translations (
-                id TEXT PRIMARY KEY,
-                source_text TEXT,
-                source_language TEXT,
-                target_language TEXT,
-                translation TEXT,
-                timestamp INTEGER
-            )
-            ''')
-            
-            # Create indexes for faster lookups
-            self.cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_translation_lookup ON translations 
-            (source_language, target_language, source_text)
-            ''')
-            
-            self.cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_timestamp ON translations (timestamp)
-            ''')
-            
-            self.conn.commit()
-            self.logger.info("PostgreSQL cache initialized")
-        except Exception as e:
-            self.logger.error(f"Error initializing PostgreSQL database: {str(e)}")
-            raise
-    
-    def _generate_id(self, source_text: str, source_language: str, target_language: str) -> str:
-        """
-        Generate a unique ID for a translation entry.
-        
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Unique ID string
-        """
-        key = f"{source_language}:{target_language}:{source_text}"
-        return hashlib.md5(key.encode('utf-8')).hexdigest()
-    
-    def get(self, source_text: str, source_language: str, target_language: str) -> Optional[str]:
-        """
-        Get a translation from the cache.
-        
-        Args:
-            source_text: Original text to look up
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Cached translation or None if not found
-        """
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            entry_id = self._generate_id(source_text, source_language, target_language)
-            
-            self.cursor.execute(
-                '''
-                SELECT translation FROM translations 
-                WHERE id = %s AND timestamp > %s
-                ''',
-                (entry_id, expiry_time)
-            )
-            
-            result = self.cursor.fetchone()
-            if result:
-                return result[0]
-            return None
-        except Exception as e:
-            self.logger.error(f"Error retrieving from PostgreSQL cache: {str(e)}")
-            return None
-    
-    def set(self, source_text: str, source_language: str, target_language: str, 
-            translation: str) -> bool:
-        """
-        Store a translation in the cache.
-        
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
-            translation: Translated text to store
-            
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            current_time = int(time.time())
-            entry_id = self._generate_id(source_text, source_language, target_language)
-            
-            self.cursor.execute(
-                '''
-                INSERT INTO translations 
-                (id, source_text, source_language, target_language, translation, timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) 
-                DO UPDATE SET translation = EXCLUDED.translation, timestamp = EXCLUDED.timestamp
-                ''',
-                (entry_id, source_text, source_language, target_language, translation, current_time)
-            )
-            
-            self.conn.commit()
-            return True
-        except Exception as e:
-            self.logger.error(f"Error setting PostgreSQL cache: {str(e)}")
-            return False
-    
-    def batch_get(self, items: List[Tuple[str, str, str]]) -> Dict[Tuple[str, str, str], Optional[str]]:
-        """
-        Get multiple translations from the cache in one operation.
-        
-        Args:
-            items: List of (source_text, source_language, target_language) tuples
-            
-        Returns:
-            Dictionary mapping each input tuple to its cached translation (or None)
-        """
-        results = {}
-        if not items:
-            return results
-            
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            
-            # Generate IDs for all items
-            ids = [self._generate_id(text, src_lang, tgt_lang) for text, src_lang, tgt_lang in items]
-            id_to_item = {self._generate_id(text, src_lang, tgt_lang): (text, src_lang, tgt_lang) 
-                         for text, src_lang, tgt_lang in items}
-            
-            # Using ANY to match multiple IDs in PostgreSQL
-            self.cursor.execute(
-                '''
-                SELECT id, translation 
-                FROM translations 
-                WHERE id = ANY(%s)
-                AND timestamp > %s
-                ''',
-                (ids, expiry_time)
-            )
-            
-            # Map query results back to original items
-            for row in self.cursor.fetchall():
-                entry_id, translation = row
-                if entry_id in id_to_item:
-                    results[id_to_item[entry_id]] = translation
-            
-            # Add None for missing items
-            for item in items:
-                if item not in results:
-                    results[item] = None
-                    
-            return results
-        except Exception as e:
-            self.logger.error(f"Error in PostgreSQL batch get: {str(e)}")
-            # Return None for all items on error
-            return {item: None for item in items}
-    
-    def batch_set(self, translations: Dict[Tuple[str, str, str], str]) -> int:
-        """
-        Store multiple translations in the cache in one operation.
-        
-        Args:
-            translations: Dictionary mapping (source_text, source_language, target_language)
-                          tuples to their translations
-                          
-        Returns:
-            Number of items successfully cached
-        """
-        if not translations:
-            return 0
-            
-        try:
-            current_time = int(time.time())
-            
-            # Begin a transaction
-            with self.conn:
-                values = []
-                for (source_text, source_language, target_language), translation in translations.items():
-                    entry_id = self._generate_id(source_text, source_language, target_language)
-                    values.append((entry_id, source_text, source_language, target_language, translation, current_time))
-                
-                # Use execute_values for efficient batch insert
-                self.psycopg2.extras.execute_values(
-                    self.cursor,
-                    '''
-                    INSERT INTO translations 
-                    (id, source_text, source_language, target_language, translation, timestamp)
-                    VALUES %s
-                    ON CONFLICT (id) 
-                    DO UPDATE SET translation = EXCLUDED.translation, timestamp = EXCLUDED.timestamp
-                    ''',
-                    values
-                )
-                
-                return len(values)
-        except Exception as e:
-            self.logger.error(f"Error in PostgreSQL batch set: {str(e)}")
-            return 0
-    
-    def contains(self, source_text: str, source_language: str, target_language: str) -> bool:
-        """
-        Check if a translation exists in the cache.
-        
-        Args:
-            source_text: Original text to check
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Boolean indicating if the translation is cached
-        """
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            entry_id = self._generate_id(source_text, source_language, target_language)
-            
-            self.cursor.execute(
-                '''
-                SELECT 1 FROM translations 
-                WHERE id = %s AND timestamp > %s
-                LIMIT 1
-                ''',
-                (entry_id, expiry_time)
-            )
-            
-            return self.cursor.fetchone() is not None
-        except Exception as e:
-            self.logger.error(f"Error checking PostgreSQL cache: {str(e)}")
-            return False
-    
-    def cleanup(self) -> int:
-        """
-        Remove expired entries from the cache.
-        
-        Returns:
-            Number of items removed
-        """
-        try:
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            
-            self.cursor.execute(
-                "DELETE FROM translations WHERE timestamp <= %s",
-                (expiry_time,)
-            )
-            
-            count = self.cursor.rowcount
-            self.conn.commit()
-            self.logger.info(f"Removed {count} expired cache entries")
-            return count
-        except Exception as e:
-            self.logger.error(f"Error cleaning up PostgreSQL cache: {str(e)}")
-            return 0
-    
-    def flush(self) -> bool:
-        """
-        Ensure all pending writes are committed to persistent storage.
-        
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            self.conn.commit()
-            return True
-        except Exception as e:
-            self.logger.error(f"Error flushing PostgreSQL cache: {str(e)}")
-            return False
-    
-    def clear(self) -> bool:
-        """
-        Clear all entries from the cache.
-        
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            self.cursor.execute("TRUNCATE TABLE translations")
-            self.conn.commit()
-            self.logger.info("Cache cleared")
-            return True
-        except Exception as e:
-            self.logger.error(f"Error clearing PostgreSQL cache: {str(e)}")
-            return False
-    
-    def stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the cache.
-        
-        Returns:
-            Dictionary with cache statistics
-        """
-        stats = {
-            'total_entries': 0,
-            'valid_entries': 0,
-            'expired_entries': 0,
-            'size_bytes': 0,
-            'languages': {
-                'source': [],
-                'target': []
-            }
-        }
-        
-        try:
-            # Get total entries
-            self.cursor.execute("SELECT COUNT(*) FROM translations")
-            stats['total_entries'] = self.cursor.fetchone()[0]
-            
-            # Get valid entries
-            current_time = int(time.time())
-            expiry_time = current_time - self.ttl
-            
-            self.cursor.execute(
-                "SELECT COUNT(*) FROM translations WHERE timestamp > %s",
-                (expiry_time,)
-            )
-            stats['valid_entries'] = self.cursor.fetchone()[0]
-            
-            # Calculate expired entries
-            stats['expired_entries'] = stats['total_entries'] - stats['valid_entries']
-            
-            # Get languages
-            self.cursor.execute(
-                "SELECT DISTINCT source_language, target_language FROM translations"
-            )
-            language_pairs = self.cursor.fetchall()
-            source_languages = {lang[0] for lang in language_pairs}
-            target_languages = {lang[1] for lang in language_pairs}
-            stats['languages'] = {
-                'source': list(source_languages),
-                'target': list(target_languages)
-            }
-            
-            # Estimate size
-            self.cursor.execute(
-                "SELECT pg_total_relation_size('translations')"
-            )
-            size_result = self.cursor.fetchone()
-            if size_result and size_result[0]:
-                stats['size_bytes'] = size_result[0]
-            
-            return stats
-        except Exception as e:
-            self.logger.error(f"Error getting PostgreSQL cache stats: {str(e)}")
-            return stats
-    
-    def __del__(self):
-        """
-        Destructor to ensure proper cleanup of database connections.
-        """
-        try:
-            if self.conn:
-                self.conn.close()
-        except:
-            pass
+    return os.path.join(*paths)
 
 
-class MemoryCache(AbstractCache):
+def ensure_directory(directory: str) -> bool:
     """
-    In-memory implementation of the cache for testing or small workloads.
+    Ensure a directory exists, creating it if necessary.
+    
+    Args:
+        directory: Directory path
+        
+    Returns:
+        Boolean indicating success
     """
-    
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the memory cache.
-        
-        Args:
-            config: Configuration dictionary
-        """
-        super().__init__(config)
-        self.cache = {}
-        self.logger.info("Memory cache initialized")
-    
-    def get(self, source_text: str, source_language: str, target_language: str) -> Optional[str]:
-        """
-        Get a translation from the cache.
-        
-        Args:
-            source_text: Original text to look up
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Cached translation or None if not found
-        """
-        key = (source_text, source_language, target_language)
-        entry = self.cache.get(key)
-        
-        if not entry:
-            return None
-            
-        timestamp, translation = entry
-        current_time = int(time.time())
-        
-        if current_time - timestamp > self.ttl:
-            # Entry expired
-            return None
-            
-        return translation
-    
-    def set(self, source_text: str, source_language: str, target_language: str, 
-            translation: str) -> bool:
-        """
-        Store a translation in the cache.
-        
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
-            translation: Translated text to store
-            
-        Returns:
-            Boolean indicating success
-        """
-        key = (source_text, source_language, target_language)
-        self.cache[key] = (int(time.time()), translation)
+    try:
+        os.makedirs(directory, exist_ok=True)
         return True
-    
-    def batch_get(self, items: List[Tuple[str, str, str]]) -> Dict[Tuple[str, str, str], Optional[str]]:
-        """
-        Get multiple translations from the cache in one operation.
-        
-        Args:
-            items: List of (source_text, source_language, target_language) tuples
-            
-        Returns:
-            Dictionary mapping each input tuple to its cached translation (or None)
-        """
-        results = {}
-        current_time = int(time.time())
-        
-        for item in items:
-            entry = self.cache.get(item)
-            if entry and (current_time - entry[0] <= self.ttl):
-                results[item] = entry[1]
-            else:
-                results[item] = None
-                
-        return results
-    
-    def batch_set(self, translations: Dict[Tuple[str, str, str], str]) -> int:
-        """
-        Store multiple translations in the cache in one operation.
-        
-        Args:
-            translations: Dictionary mapping (source_text, source_language, target_language)
-                          tuples to their translations
-                          
-        Returns:
-            Number of items successfully cached
-        """
-        current_time = int(time.time())
-        
-        for key, translation in translations.items():
-            self.cache[key] = (current_time, translation)
-            
-        return len(translations)
-    
-    def contains(self, source_text: str, source_language: str, target_language: str) -> bool:
-        """
-        Check if a translation exists in the cache.
-        
-        Args:
-            source_text: Original text to check
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Boolean indicating if the translation is cached
-        """
-        key = (source_text, source_language, target_language)
-        entry = self.cache.get(key)
-        
-        if not entry:
-            return False
-            
-        timestamp = entry[0]
-        current_time = int(time.time())
-        
-        return current_time - timestamp <= self.ttl
-    
-    def cleanup(self) -> int:
-        """
-        Remove expired entries from the cache.
-        
-        Returns:
-            Number of items removed
-        """
-        current_time = int(time.time())
-        expired_keys = []
-        
-        for key, (timestamp, _) in self.cache.items():
-            if current_time - timestamp > self.ttl:
-                expired_keys.append(key)
-                
-        for key in expired_keys:
-            del self.cache[key]
-            
-        return len(expired_keys)
-    
-    def flush(self) -> bool:
-        """
-        Ensure all pending writes are committed to persistent storage.
-        Memory cache doesn't need flushing, so always returns True.
-        
-        Returns:
-            Boolean indicating success
-        """
-        return True
-    
-    def clear(self) -> bool:
-        """
-        Clear all entries from the cache.
-        
-        Returns:
-            Boolean indicating success
-        """
-        self.cache.clear()
-        return True
-    
-    def stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about the cache.
-        
-        Returns:
-            Dictionary with cache statistics
-        """
-        current_time = int(time.time())
-        total = len(self.cache)
-        valid = sum(1 for timestamp, _ in self.cache.values() if current_time - timestamp <= self.ttl)
-        
-        source_languages = set()
-        target_languages = set()
-        size_bytes = 0
-        
-        for (text, src_lang, tgt_lang), (_, translation) in self.cache.items():
-            source_languages.add(src_lang)
-            target_languages.add(tgt_lang)
-            size_bytes += len(text.encode('utf-8')) + len(translation.encode('utf-8'))
-        
-        return {
-            'total_entries': total,
-            'valid_entries': valid,
-            'expired_entries': total - valid,
-            'size_bytes': size_bytes,
-            'languages': {
-                'source': list(source_languages),
-                'target': list(target_languages)
-            }
-        }
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error creating directory {directory}: {str(e)}")
+        return False
 
 
-class CacheManager:
+def is_empty_string(text: Optional[str]) -> bool:
     """
-    Manages caching operations and coordinates between different cache implementations.
+    Check if a string is None, empty, or contains only whitespace.
+    
+    Args:
+        text: String to check
+        
+    Returns:
+        Boolean indicating if string is effectively empty
     """
+    return text is None or text.strip() == ''
+
+
+def get_exception_details() -> str:
+    """
+    Get detailed information about the current exception.
+    Useful for logging detailed error information.
     
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the cache manager.
-        
-        Args:
-            config: Configuration dictionary
-        """
-        self.config = config
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.cache_type = config.get('cache', {}).get('type', 'sqlite')
-        self.cache = self._create_cache(self.cache_type)
-        
-        # Stats tracking
-        self.hit_count = 0
-        self.miss_count = 0
-        self.lock = threading.RLock()  # Reentrant lock for thread safety
+    Returns:
+        Formatted exception details
+    """
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    if not exc_type:
+        return "No exception information available"
     
-    def _create_cache(self, cache_type: str) -> AbstractCache:
-        """
-        Create and initialize the appropriate cache implementation.
-        
-        Args:
-            cache_type: Type of cache to create
-            
-        Returns:
-            Initialized cache implementation
-            
-        Raises:
-            ValueError: If specified cache type is not supported
-        """
-        self.logger.info(f"Initializing {cache_type} cache")
-        
-        if cache_type.lower() == 'sqlite':
-            return SQLiteCache(self.config)
-        elif cache_type.lower() == 'postgres':
-            return PostgresCache(self.config)
-        elif cache_type.lower() == 'memory':
-            return MemoryCache(self.config)
-        else:
-            error_msg = f"Unsupported cache type: {cache_type}. Use 'sqlite', 'postgres', or 'memory'."
-            self.logger.error(error_msg)
-            raise ValueError(error_msg)
-    
-    def get(self, source_text: str, source_language: str, target_language: str) -> Optional[str]:
-        """
-        Get a translation from the cache.
-        
-        Args:
-            source_text: Original text to look up
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Cached translation or None if not found
-        """
-        with self.lock:
-            result = self.cache.get(source_text, source_language, target_language)
-            if result:
-                self.hit_count += 1
-                self.logger.debug(f"Cache hit for: {source_language} -> {target_language}, text length: {len(source_text)}")
-            else:
-                self.miss_count += 1
-                self.logger.debug(f"Cache miss for: {source_language} -> {target_language}, text length: {len(source_text)}")
-            return result
-    
-    def set(self, source_text: str, source_language: str, target_language: str, 
-            translation: str) -> bool:
-        """
-        Store a translation in the cache.
-        
-        Args:
-            source_text: Original text
-            source_language: Source language code
-            target_language: Target language code
-            translation: Translated text to store
-            
-        Returns:
-            Boolean indicating success
-        """
-        with self.lock:
-            success = self.cache.set(source_text, source_language, target_language, translation)
-            if success:
-                self.logger.debug(f"Cached: {source_language} -> {target_language}, text length: {len(source_text)}")
-            else:
-                self.logger.warning(f"Failed to cache: {source_language} -> {target_language}, text length: {len(source_text)}")
-            return success
-    
-    def batch_get(self, texts: List[str], source_language: str, 
-                target_language: str) -> Dict[str, Optional[str]]:
-        """
-        Get multiple translations from the cache.
-        
-        Args:
-            texts: List of source texts
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Dictionary mapping source texts to translations (or None if not found)
-        """
-        if not texts:
-            return {}
-            
-        with self.lock:
-            # Create a list of tuples for batch_get
-            items = [(text, source_language, target_language) for text in texts]
-            
-            # Get the results from the cache
-            results_by_tuple = self.cache.batch_get(items)
-            
-            # Convert to a mapping from source text to translation
-            results = {}
-            for text in texts:
-                key = (text, source_language, target_language)
-                if key in results_by_tuple:
-                    results[text] = results_by_tuple[key]
-                    if results[text] is not None:
-                        self.hit_count += 1
-                    else:
-                        self.miss_count += 1
-                else:
-                    results[text] = None
-                    self.miss_count += 1
-            
-            hit_count = sum(1 for value in results.values() if value is not None)
-            miss_count = len(texts) - hit_count
-            
-            self.logger.debug(f"Batch cache lookup: {hit_count} hits, {miss_count} misses")
-            
-            return results
-    
-    def batch_set(self, texts: List[str], translations: List[str], 
-                source_language: str, target_language: str) -> int:
-        """
-        Store multiple translations in the cache.
-        
-        Args:
-            texts: List of source texts
-            translations: List of translated texts
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Number of items successfully cached
-        """
-        if not texts or not translations or len(texts) != len(translations):
-            self.logger.warning("Invalid batch_set parameters: texts and translations lists must be non-empty and of the same length")
-            return 0
-            
-        with self.lock:
-            # Create a dictionary of tuples to translations
-            translation_dict = {
-                (text, source_language, target_language): trans
-                for text, trans in zip(texts, translations)
-            }
-            
-            # Set the translations in the cache
-            count = self.cache.batch_set(translation_dict)
-            
-            self.logger.debug(f"Batch cached {count} translations from {source_language} to {target_language}")
-            
-            return count
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Get statistics about cache usage.
-        
-        Returns:
-            Dictionary with cache statistics
-        """
-        with self.lock:
-            cache_stats = self.cache.stats()
-            
-            # Add manager-level stats
-            total_requests = self.hit_count + self.miss_count
-            hit_rate = (self.hit_count / total_requests) if total_requests > 0 else 0
-            
-            stats = {
-                'hit_count': self.hit_count,
-                'miss_count': self.miss_count,
-                'total_requests': total_requests,
-                'hit_rate': hit_rate,
-                'cache_type': self.cache_type,
-                **cache_stats
-            }
-            
-            return stats
-    
-    def cleanup(self) -> None:
-        """
-        Perform cache maintenance operations.
-        """
-        with self.lock:
-            removed = self.cache.cleanup()
-            self.logger.info(f"Cache cleanup removed {removed} expired entries")
-    
-    def flush(self) -> None:
-        """
-        Ensure all pending writes are committed to persistent storage.
-        """
-        with self.lock:
-            success = self.cache.flush()
-            if success:
-                self.logger.debug("Cache flushed successfully")
-            else:
-                self.logger.warning("Failed to flush cache")
+    trace = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    return "".join(trace)
