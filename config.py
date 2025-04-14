@@ -70,6 +70,7 @@ class ConfigManager:
         """
         self.config_path = config_path
         self.cli_overrides = cli_overrides or {}
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.config = self._load_config()
     
     def _load_config(self) -> Dict[str, Any]:
@@ -79,7 +80,33 @@ class ConfigManager:
         Returns:
             Dict containing merged configuration
         """
-        pass
+        # Start with default configuration
+        config = self.DEFAULT_CONFIG.copy()
+        
+        # Load from YAML file if provided and exists
+        if self.config_path:
+            try:
+                if os.path.exists(self.config_path):
+                    with open(self.config_path, 'r', encoding='utf-8') as config_file:
+                        file_config = yaml.safe_load(config_file)
+                        if file_config:
+                            # Update with file configuration
+                            self._deep_update(config, file_config)
+                        else:
+                            self.logger.warning(f"Empty or invalid configuration file: {self.config_path}")
+                else:
+                    self.logger.warning(f"Configuration file not found: {self.config_path}")
+            except Exception as e:
+                self.logger.error(f"Error loading configuration file: {str(e)}")
+                # Continue with default configuration
+        
+        # Apply command-line overrides
+        self._apply_cli_overrides(config)
+        
+        # Validate the configuration
+        self._validate_config(config)
+        
+        return config
     
     def _deep_update(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
         """
@@ -89,7 +116,13 @@ class ConfigManager:
             target: Target dictionary to update
             source: Source dictionary with updates
         """
-        pass
+        for key, value in source.items():
+            if isinstance(value, dict) and key in target and isinstance(target[key], dict):
+                # If both target and source have dict at this key, recursively update
+                self._deep_update(target[key], value)
+            else:
+                # Otherwise, just update the value
+                target[key] = value
     
     def _apply_cli_overrides(self, config: Dict[str, Any]) -> None:
         """
@@ -98,7 +131,26 @@ class ConfigManager:
         Args:
             config: Configuration dictionary to update
         """
-        pass
+        for key, value in self.cli_overrides.items():
+            # Handle nested keys using dot notation (e.g., 'openai.model')
+            if '.' in key:
+                parts = key.split('.')
+                current = config
+                
+                # Navigate to the deepest level
+                for part in parts[:-1]:
+                    if part not in current:
+                        current[part] = {}
+                    elif not isinstance(current[part], dict):
+                        # If a non-dict exists at this level, replace it with a dict
+                        current[part] = {}
+                    current = current[part]
+                
+                # Set the value at the deepest level
+                current[parts[-1]] = value
+            else:
+                # Simple case: top-level override
+                config[key] = value
     
     def _validate_config(self, config: Dict[str, Any]) -> None:
         """
@@ -110,7 +162,48 @@ class ConfigManager:
         Raises:
             ValueError: If critical configuration is missing
         """
-        pass
+        # Validate required fields
+        if not config.get('input_file'):
+            raise ValueError("Input file path is required in configuration")
+        
+        if not config.get('output_file'):
+            raise ValueError("Output file path is required in configuration")
+        
+        # Validate columns to translate
+        if not config.get('columns_to_translate'):
+            raise ValueError("At least one column to translate must be specified")
+        
+        # Ensure directories exist
+        os.makedirs(os.path.dirname(os.path.abspath(config['output_file'])), exist_ok=True)
+        
+        checkpoint_dir = config.get('checkpoint', {}).get('directory')
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        cache_location = config.get('cache', {}).get('location')
+        if cache_location and config.get('cache', {}).get('type') == 'sqlite':
+            os.makedirs(os.path.dirname(os.path.abspath(cache_location)), exist_ok=True)
+        
+        intermediate_dir = config.get('intermediate_directory')
+        if intermediate_dir and config.get('write_intermediate_results'):
+            os.makedirs(intermediate_dir, exist_ok=True)
+        
+        # Validate OpenAI settings
+        api_key_env = config.get('openai', {}).get('api_key_env')
+        if api_key_env and not os.environ.get(api_key_env):
+            self.logger.warning(f"OpenAI API key environment variable '{api_key_env}' not set")
+        
+        # Validate batch size
+        if config.get('batch_size', 0) < 1:
+            self.logger.warning("Invalid batch size, setting to default (10)")
+            config['batch_size'] = 10
+        
+        # Validate retry settings
+        retry_config = config.get('retry', {})
+        if retry_config.get('max_attempts', 0) < 1:
+            retry_config['max_attempts'] = 3
+        if retry_config.get('backoff_factor', 0) < 0:
+            retry_config['backoff_factor'] = 2
     
     def get_config(self) -> Dict[str, Any]:
         """
@@ -119,7 +212,7 @@ class ConfigManager:
         Returns:
             Dict containing the merged and validated configuration
         """
-        pass
+        return self.config
     
     def get_value(self, key: str, default: Any = None) -> Any:
         """
@@ -132,4 +225,18 @@ class ConfigManager:
         Returns:
             Configuration value or default
         """
-        pass
+        if '.' in key:
+            # Handle nested keys
+            parts = key.split('.')
+            current = self.config
+            
+            # Traverse the nested dictionaries
+            for part in parts:
+                if not isinstance(current, dict) or part not in current:
+                    return default
+                current = current[part]
+            
+            return current
+        else:
+            # Simple case: top-level key
+            return self.config.get(key, default)
