@@ -123,11 +123,30 @@ class DataReader(AbstractDataHandler):
             
             self.logger.debug(f"Reading Stata file with pyreadstat: {self.input_file}")
             
-            # Read the Stata file with pandas
-            pd_df, meta = pyreadstat.read_dta(self.input_file)
+            # Read the Stata file with pandas, disable convert_categoricals
+            pd_df, meta = pyreadstat.read_dta(self.input_file, convert_categoricals=False)
             
             # Save metadata for later use if we have a metadata handler
             self._preserve_stata_metadata(meta)
+            
+            # Handle problematic columns before conversion to Spark DataFrame
+            # This should fix the type conflict issues
+            for col in pd_df.columns:
+                col_type = pd_df[col].dtype
+                
+                # Handle dates and timestamps properly
+                if pd.api.types.is_datetime64_any_dtype(col_type):
+                    pd_df[col] = pd.to_datetime(pd_df[col], errors='coerce')
+                    pd_df[col] = pd_df[col].dt.strftime('%Y-%m-%d')
+                
+                # Force consistent types for numeric columns that might have mixed types
+                # Force all integer-like and float-like columns to float (double) to avoid LongType vs DoubleType conflicts
+                if pd.api.types.is_numeric_dtype(col_type):
+                    pd_df[col] = pd_df[col].astype(float)
+                
+                # Convert objects to string while handling NaN values
+                if pd.api.types.is_object_dtype(col_type):
+                    pd_df[col] = pd_df[col].fillna('').astype(str)
             
             # Convert pandas DataFrame to Spark DataFrame
             spark_df = self.spark.createDataFrame(pd_df)
@@ -141,7 +160,7 @@ class DataReader(AbstractDataHandler):
         except Exception as e:
             self.logger.error(f"Error reading Stata file: {str(e)}")
             raise
-    
+        
     def _preserve_stata_metadata(self, meta: Any) -> None:
         """
         Preserve Stata metadata for later use.
