@@ -169,14 +169,17 @@ class DataReader(AbstractDataHandler):
             meta: Metadata object from pyreadstat
         """
         try:
-            # Extract relevant metadata
+            # Extract relevant metadata - modifica este código para adaptarse a la estructura real
             metadata = {
-                'variable_labels': meta.variable_labels,
-                'value_labels': meta.value_labels,
-                'variable_value_labels': meta.variable_value_labels,
-                'file_label': meta.file_label,
-                'file_encoding': meta.file_encoding,
-                'missing_ranges': meta.missing_ranges,
+                # Usa hasattr para verificar si el atributo existe
+                'variable_labels': meta.variable_labels if hasattr(meta, 'variable_labels') else {},
+                'value_labels': meta.value_labels if hasattr(meta, 'value_labels') else {},
+                'variable_value_labels': meta.variable_value_labels if hasattr(meta, 'variable_value_labels') else {},
+                'file_label': meta.file_label if hasattr(meta, 'file_label') else '',
+                'file_encoding': meta.file_encoding if hasattr(meta, 'file_encoding') else '',
+                'column_names': meta.column_names if hasattr(meta, 'column_names') else [],
+                'original_variable_types': meta.original_variable_types if hasattr(meta, 'original_variable_types') else {},
+                'missing_ranges': meta.missing_ranges if hasattr(meta, 'missing_ranges') else {},
                 'notes': meta.notes if hasattr(meta, 'notes') else []
             }
             
@@ -189,6 +192,8 @@ class DataReader(AbstractDataHandler):
             
         except Exception as e:
             self.logger.warning(f"Could not preserve Stata metadata: {str(e)}")
+            import traceback
+            self.logger.warning(traceback.format_exc())
     
     def read_checkpoint_data(self, partition_id: int) -> Optional[DataFrame]:
         """
