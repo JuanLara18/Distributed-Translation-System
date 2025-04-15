@@ -20,7 +20,7 @@ from modules.file_manager import DataReader, DataWriter
 from modules.translator import TranslationManager
 from modules.cache import CacheManager
 from modules.checkpoint import CheckpointManager
-from modules.utils import set_up_logging, create_spark_session, format_stats_report
+from modules.utilities import set_up_logging, create_spark_session, format_stats_report
 
 
 class TranslationOrchestrator:
