@@ -91,14 +91,25 @@ class DataReader(AbstractDataHandler):
             
             # Filter DataFrame to include only required columns if needed
             if self.config.get('optimize_memory', True):
-                all_columns = list(self.required_columns)
-                # Include any ID or key columns that might be needed
-                id_columns = self.config.get('id_columns', [])
-                all_columns.extend([col for col in id_columns if col not in all_columns])
+                # Check if we should keep all columns or just required ones
+                keep_all_columns = self.config.get('keep_all_columns', True)
                 
-                # Keep only needed columns
-                df = df.select(*all_columns)
-            
+                if keep_all_columns:
+                    # Keep all original columns (no filtering)
+                    self.logger.debug("Keeping all columns from input file")
+                    all_columns = df.columns
+                else:
+                    # Only keep columns needed for translation plus ID columns
+                    self.logger.debug("Optimizing memory by selecting only required columns")
+                    all_columns = list(self.required_columns)
+                    
+                    # Include any ID or key columns that might be needed
+                    id_columns = self.config.get('id_columns', [])
+                    all_columns.extend([col for col in id_columns if col not in all_columns])
+                    
+                    # Keep only needed columns
+                    df = df.select(*all_columns)
+
             # Clean text columns
             for col in self.columns_to_translate:
                 df = df.withColumn(col, F.when(F.col(col).isNull(), "").otherwise(F.col(col)))
@@ -275,7 +286,7 @@ class DataWriter(AbstractDataHandler):
         except Exception as e:
             self.logger.error(f"Error writing output file: {str(e)}")
             raise
-        
+            
     def _write_stata_file(self, df: DataFrame) -> None:
         """
         Write a DataFrame to a Stata file with support for Stata 18 and long strings.
@@ -302,6 +313,7 @@ class DataWriter(AbstractDataHandler):
             
             # Check which version of Stata format we can use
             try:
+                # Intentar importar el formato más moderno
                 from pyreadstat.pyreadstat import StataWriteFileFormat
                 stata_format = StataWriteFileFormat.STATA_118  # Format for Stata 14-18
                 supports_stata_format = True
@@ -314,55 +326,28 @@ class DataWriter(AbstractDataHandler):
             write_dta_params = inspect.signature(pyreadstat.write_dta).parameters
             supports_strl = 'strl_columns' in write_dta_params
             
-            # More conservative string length limit (Stata has a 2045 limit for regular strings)
-            # Using 2000 to be safe
-            MAX_STRING_LENGTH = 2000
-            
-            # Proactively truncate ALL string columns to be safe
+            # Identify columns needing strL storage
             string_cols = pd_df.select_dtypes(include=['object']).columns
+            strL_columns = []
+            
             for col in string_cols:
-                # Check if there are any strings that need truncation
                 max_len = pd_df[col].astype(str).str.len().max()
-                if max_len > MAX_STRING_LENGTH:
-                    self.logger.warning(f"Truncating column '{col}' from max length {max_len} to {MAX_STRING_LENGTH} characters")
-                    pd_df[col] = pd_df[col].astype(str).str.slice(0, MAX_STRING_LENGTH)
-                    
-                    # Double-check truncation worked
-                    new_max = pd_df[col].astype(str).str.len().max()
-                    self.logger.info(f"After truncation, max length of '{col}' is now {new_max}")
-                else:
-                    self.logger.debug(f"Column '{col}' has max length {max_len}, no truncation needed")
+                if max_len > 2000:
+                    strL_columns.append(col)
+                    self.logger.info(f"Column '{col}' with max length {max_len} will use strL storage")
             
-            # Convert any problematic data types
-            for col in pd_df.columns:
-                # Convert datetime columns to strings
-                if pd.api.types.is_datetime64_any_dtype(pd_df[col].dtype):
-                    self.logger.info(f"Converting datetime column '{col}' to string")
-                    pd_df[col] = pd_df[col].dt.strftime('%Y-%m-%d')
-                    
-                # Ensure integer types are consistent
-                if pd.api.types.is_integer_dtype(pd_df[col].dtype):
-                    self.logger.debug(f"Converting integer column '{col}' to int32")
-                    pd_df[col] = pd_df[col].astype(np.int32)
-                    
-                # Ensure float types are consistent
-                if pd.api.types.is_float_dtype(pd_df[col].dtype):
-                    self.logger.debug(f"Converting float column '{col}' to float64")
-                    pd_df[col] = pd_df[col].astype(np.float64)
-            
-            # Try multiple writing approaches in order of preference
+            # Write with optimal parameters
             try:
-                # First attempt: Use optimal parameters if supported
-                if supports_stata_format and supports_strl:
-                    self.logger.info("Writing Stata file using optimal parameters (Stata 118 format with strl support)")
+                if supports_stata_format and supports_strl and strL_columns:
+                    self.logger.info("Writing Stata file using Stata 118 format with strL columns")
                     pyreadstat.write_dta(
                         pd_df,
                         self.output_file,
                         write_file_format=stata_format,
-                        strl_columns=[]  # Empty list - not using strl even if supported
+                        strl_columns=strL_columns
                     )
                 elif supports_stata_format:
-                    self.logger.info("Writing Stata file using Stata 118 format (without strl support)")
+                    self.logger.info("Writing Stata file using Stata 118 format")
                     pyreadstat.write_dta(
                         pd_df,
                         self.output_file,
@@ -375,50 +360,31 @@ class DataWriter(AbstractDataHandler):
                         self.output_file,
                         version=15
                     )
-                    
+                        
                 self.logger.info(f"Successfully wrote Stata file with {len(pd_df)} rows")
                 
-            except Exception as e1:
-                self.logger.warning(f"First write attempt failed: {str(e1)}. Trying with more conservative approach...")
+            except Exception as e:
+                self.logger.error(f"Failed to write Stata file: {str(e)}")
                 
-                # Second attempt: Try with version 14 (more compatible)
-                try:
-                    self.logger.info("Trying to write with version 14 (more compatible)")
-                    pyreadstat.write_dta(
-                        pd_df,
-                        self.output_file,
-                        version=14
-                    )
-                    self.logger.info(f"Successfully wrote Stata file with version 14")
-                    
-                except Exception as e2:
-                    self.logger.warning(f"Second write attempt failed: {str(e2)}. Trying most basic approach...")
-                    
-                    # Third attempt: Most conservative approach - version 13 and more aggressive truncation
-                    try:
-                        # Even more aggressive truncation for all string columns
-                        for col in string_cols:
-                            pd_df[col] = pd_df[col].astype(str).str.slice(0, 500)
-                            self.logger.warning(f"Aggressively truncated column '{col}' to 500 characters")
-                        
-                        pyreadstat.write_dta(
-                            pd_df,
-                            self.output_file,
-                            version=13
-                        )
-                        self.logger.info(f"Successfully wrote Stata file with version 13 and aggressive truncation")
-                        
-                    except Exception as e3:
-                        self.logger.error(f"All write attempts failed. Last error: {str(e3)}")
-                        
-                        # Final attempt: CSV fallback
-                        fallback_path = self.output_file.replace('.dta', '.csv')
-                        self.logger.warning(f"Falling back to CSV output at: {fallback_path}")
-                        pd_df.to_csv(fallback_path, index=False)
-                        self.logger.info(f"Saved data as CSV instead at {fallback_path}")
-                        
-                        # Re-raise the original exception
-                        raise
+                # Approach for handling failures
+                # Create a CSV backup and raise the error
+                backup_path = self.output_file + '.csv'
+                self.logger.warning(f"Creating CSV backup at: {backup_path}")
+                pd_df.to_csv(backup_path, index=False)
+                
+                # Also create a parquet backup which can handle any data type and maintain all data
+                parquet_backup = self.output_file + '.parquet'
+                self.logger.warning(f"Creating Parquet backup at: {parquet_backup}")
+                pd_df.to_parquet(parquet_backup, index=False)
+                
+                raise
+                
+        except ImportError:
+            self.logger.error("pyreadstat not installed. Please install it with: pip install pyreadstat")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error writing Stata file: {str(e)}")
+            raise
             
         except ImportError:
             self.logger.error("pyreadstat not installed. Please install it with: pip install pyreadstat")
