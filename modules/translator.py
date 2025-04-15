@@ -276,25 +276,6 @@ class OpenAITranslator(AbstractTranslator):
         self.logger.debug(f"Batch completed: {actual_api_calls} API calls for {len(filtered_texts)} texts")
         
         return results
-    
-    def batch_translate_without_stats(self, texts: List[str], source_languages: List[str], target_language: str) -> List[str]:
-        """
-        Translate a batch of texts without updating internal statistics.
-        Used for pre-caching to avoid double-counting stats.
-        
-        Args:
-            texts: List of texts to translate
-            source_languages: List of source languages
-            target_language: Target language code
-            
-        Returns:
-            List of translated texts
-        """
-        if not texts:
-            return []
-            
-        # Use the translator's batch_translate method directly
-        return self.translator.batch_translate(texts, source_languages, target_language)
 
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
@@ -672,6 +653,25 @@ class TranslationManager:
         
         return output_df
     
+    def batch_translate_without_stats(self, texts: List[str], source_languages: List[str], target_language: str) -> List[str]:
+        """
+        Translate a batch of texts without updating internal statistics.
+        Used for pre-caching to avoid double-counting stats.
+        
+        Args:
+            texts: List of texts to translate
+            source_languages: List of source languages
+            target_language: Target language code
+            
+        Returns:
+            List of translated texts
+        """
+        if not texts:
+            return []
+            
+        # Use the translator's batch_translate method directly
+        return self.translator.batch_translate(texts, source_languages, target_language)
+
     def get_stats(self) -> Dict[str, int]:
         """
         Get statistics from the translation process.
