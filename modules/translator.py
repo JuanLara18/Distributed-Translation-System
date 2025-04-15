@@ -323,10 +323,11 @@ class TranslationManager:
             'api_calls': 0,
             'errors': 0
         }
-    
+        
     def process_dataframe(self, df: DataFrame) -> DataFrame:
         """
-        Process a dataframe by translating all required columns.
+        Process a dataframe by translating all required columns efficiently
+        using batch processing and caching.
         
         Args:
             df: DataFrame to process
@@ -340,42 +341,216 @@ class TranslationManager:
             
         # Create an output dataframe starting with the original data
         processed_df = df
-
-        # Extrae los valores que necesitas para evitar capturar 'self'
-        target_language = self.target_language
-        config_json = json.dumps(self.config)  # Esto ya es un string, sin referencias a self
-
-        # Define el UDF usando la función global (que ya definiste previamente)
-        translate_udf = F.udf(
-            lambda text, src_lang: translate_text_global(text, src_lang, target_language, config_json),
-            StringType()
-        )
-
+        
+        # Process each column
         for column in self.columns_to_translate:
-            # Check if column exists
             if column not in df.columns:
                 self.logger.warning(f"Column '{column}' not found in dataframe, skipping")
                 continue
-
+            
             # Generate the output column name
-            output_column = f"{column}_{target_language}"
-
-            # Apply translation UDF
+            output_column = f"{column}_{self.target_language}"
+            
+            # Collect data for processing
+            self.logger.info(f"Collecting data for column '{column}'")
+            
             if self.source_language_column and self.source_language_column in df.columns:
                 self.logger.info(f"Translating column '{column}' using language from '{self.source_language_column}'")
-                processed_df = processed_df.withColumn(
-                    output_column,
-                    translate_udf(F.col(column), F.col(self.source_language_column))
-                )
+                
+                # Convert to pandas for easier processing
+                pandas_df = df.select(column, self.source_language_column).toPandas()
+                
+                # Remove rows with empty values
+                pandas_df = pandas_df[pandas_df[column].notna() & (pandas_df[column] != "")]
+                
+                # Create a dictionary mapping texts to languages
+                text_lang_pairs = {}
+                for _, row in pandas_df.iterrows():
+                    text = row[column]
+                    lang = row[self.source_language_column] if row[self.source_language_column] else "auto"
+                    if text and isinstance(text, str):
+                        text_lang_pairs[text] = lang
+                
+                self.logger.info(f"Found {len(text_lang_pairs)} unique non-empty texts to translate in column '{column}'")
+                
+                # If no texts to translate, skip this column
+                if not text_lang_pairs:
+                    self.logger.warning(f"No texts to translate in column '{column}', skipping")
+                    continue
+                
+                # Process in batches
+                batch_size = self.batch_size
+                texts = list(text_lang_pairs.keys())
+                langs = [text_lang_pairs[text] for text in texts]
+                
+                # Initialize translations dictionary
+                translations = {}
+                
+                # Process in batches
+                for i in range(0, len(texts), batch_size):
+                    batch_texts = texts[i:i+batch_size]
+                    batch_langs = langs[i:i+batch_size]
+                    
+                    self.logger.info(f"Processing batch {i//batch_size + 1} of {(len(texts) + batch_size - 1)//batch_size} for column '{column}'")
+                    
+                    # First check cache for all texts in batch
+                    batch_cache_results = {}
+                    for text, lang in zip(batch_texts, batch_langs):
+                        cached = self.cache_manager.get(text, lang, self.target_language)
+                        if cached:
+                            batch_cache_results[text] = cached
+                            self.stats['cached_hits'] += 1
+                    
+                    # Texts not found in cache
+                    texts_to_translate = []
+                    langs_to_translate = []
+                    for text, lang in zip(batch_texts, batch_langs):
+                        if text not in batch_cache_results:
+                            texts_to_translate.append(text)
+                            langs_to_translate.append(lang)
+                    
+                    # Only call API if we have texts to translate
+                    if texts_to_translate:
+                        self.logger.info(f"Translating {len(texts_to_translate)} texts via API for column '{column}'")
+                        
+                        # Translate texts not in cache
+                        try:
+                            api_results = []
+                            for text, lang in zip(texts_to_translate, langs_to_translate):
+                                try:
+                                    translation = self.translator.translate(text, lang, self.target_language)
+                                    self.stats['api_calls'] += 1
+                                    self.stats['translated_rows'] += 1
+                                    api_results.append(translation)
+                                    
+                                    # Add to cache
+                                    self.cache_manager.set(text, lang, self.target_language, translation)
+                                except Exception as e:
+                                    self.logger.error(f"Error translating text: {str(e)}")
+                                    self.stats['errors'] += 1
+                                    # Use the original text as fallback
+                                    api_results.append(text)
+                            
+                            # Add API results to batch results
+                            for text, translation in zip(texts_to_translate, api_results):
+                                batch_cache_results[text] = translation
+                        except Exception as e:
+                            self.logger.error(f"Batch translation error: {str(e)}")
+                            # Use original texts as fallback for any failures
+                            for text in texts_to_translate:
+                                if text not in batch_cache_results:
+                                    batch_cache_results[text] = text
+                                    self.stats['errors'] += 1
+                    
+                    # Add batch results to all translations
+                    translations.update(batch_cache_results)
+                
+                # Create UDF to map texts to translations
+                def map_translation(text):
+                    if not text or not isinstance(text, str) or text.strip() == "":
+                        return ""
+                    return translations.get(text, text)
+                
+                map_udf = F.udf(map_translation, StringType())
+                
+                # Apply translations to DataFrame
+                processed_df = processed_df.withColumn(output_column, map_udf(F.col(column)))
+                
+                self.logger.info(f"Completed translation of column '{column}'")
             else:
+                # No source language column, use auto-detection for all
                 self.logger.info(f"Translating column '{column}' with auto language detection")
-                processed_df = processed_df.withColumn(
-                    output_column,
-                    translate_udf(F.col(column), F.lit("auto"))
-                )
-
+                
+                # Convert to pandas for easier processing
+                pandas_df = df.select(column).toPandas()
+                
+                # Remove rows with empty values
+                pandas_df = pandas_df[pandas_df[column].notna() & (pandas_df[column] != "")]
+                
+                # Get unique texts
+                unique_texts = pandas_df[column].unique().tolist()
+                unique_texts = [text for text in unique_texts if text and isinstance(text, str)]
+                
+                self.logger.info(f"Found {len(unique_texts)} unique non-empty texts to translate in column '{column}'")
+                
+                # If no texts to translate, skip this column
+                if not unique_texts:
+                    self.logger.warning(f"No texts to translate in column '{column}', skipping")
+                    continue
+                
+                # Process in batches
+                batch_size = self.batch_size
+                
+                # Initialize translations dictionary
+                translations = {}
+                
+                # Process in batches
+                for i in range(0, len(unique_texts), batch_size):
+                    batch_texts = unique_texts[i:i+batch_size]
+                    
+                    self.logger.info(f"Processing batch {i//batch_size + 1} of {(len(unique_texts) + batch_size - 1)//batch_size} for column '{column}'")
+                    
+                    # First check cache for all texts in batch
+                    batch_cache_results = {}
+                    for text in batch_texts:
+                        cached = self.cache_manager.get(text, "auto", self.target_language)
+                        if cached:
+                            batch_cache_results[text] = cached
+                            self.stats['cached_hits'] += 1
+                    
+                    # Texts not found in cache
+                    texts_to_translate = [text for text in batch_texts if text not in batch_cache_results]
+                    
+                    # Only call API if we have texts to translate
+                    if texts_to_translate:
+                        self.logger.info(f"Translating {len(texts_to_translate)} texts via API for column '{column}'")
+                        
+                        # Translate texts not in cache
+                        try:
+                            api_results = []
+                            for text in texts_to_translate:
+                                try:
+                                    translation = self.translator.translate(text, "auto", self.target_language)
+                                    self.stats['api_calls'] += 1
+                                    self.stats['translated_rows'] += 1
+                                    api_results.append(translation)
+                                    
+                                    # Add to cache
+                                    self.cache_manager.set(text, "auto", self.target_language, translation)
+                                except Exception as e:
+                                    self.logger.error(f"Error translating text: {str(e)}")
+                                    self.stats['errors'] += 1
+                                    # Use the original text as fallback
+                                    api_results.append(text)
+                            
+                            # Add API results to batch results
+                            for text, translation in zip(texts_to_translate, api_results):
+                                batch_cache_results[text] = translation
+                        except Exception as e:
+                            self.logger.error(f"Batch translation error: {str(e)}")
+                            # Use original texts as fallback for any failures
+                            for text in texts_to_translate:
+                                if text not in batch_cache_results:
+                                    batch_cache_results[text] = text
+                                    self.stats['errors'] += 1
+                    
+                    # Add batch results to all translations
+                    translations.update(batch_cache_results)
+                
+                # Create UDF to map texts to translations
+                def map_translation(text):
+                    if not text or not isinstance(text, str) or text.strip() == "":
+                        return ""
+                    return translations.get(text, text)
+                
+                map_udf = F.udf(map_translation, StringType())
+                
+                # Apply translations to DataFrame
+                processed_df = processed_df.withColumn(output_column, map_udf(F.col(column)))
+                
+                self.logger.info(f"Completed translation of column '{column}'")
+        
         return processed_df
-
     
     def _translate_with_language(self, text: str, source_language: str) -> str:
         """
