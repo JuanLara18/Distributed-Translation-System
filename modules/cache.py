@@ -235,11 +235,15 @@ class SQLiteCache(AbstractCache):
             Cached translation or None if not found
         """
         try:
+            # Create connection within the method
+            conn = sqlite3.connect(self.location, check_same_thread=False, timeout=30.0)
+            cursor = conn.cursor()
+            
             current_time = int(time.time())
             expiry_time = current_time - self.ttl
             entry_id = self._generate_id(source_text, source_language, target_language)
             
-            self.cursor.execute(
+            cursor.execute(
                 '''
                 SELECT translation FROM translations 
                 WHERE id = ? AND timestamp > ?
@@ -247,7 +251,12 @@ class SQLiteCache(AbstractCache):
                 (entry_id, expiry_time)
             )
             
-            result = self.cursor.fetchone()
+            result = cursor.fetchone()
+            
+            # Close connection
+            cursor.close()
+            conn.close()
+            
             if result:
                 return result[0]
             return None

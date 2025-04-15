@@ -13,6 +13,7 @@ import logging
 import concurrent.futures
 from functools import partial
 import re
+import json
 
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
@@ -23,6 +24,18 @@ from modules.utilities import (
     retry, detect_language, clean_text, 
     truncate_text, get_normalized_language_code
 )
+
+def translate_text_global(text: str, source_language: str, target_language: str, config_json: str) -> str:
+    """
+    Función global para traducir un texto sin capturar objetos no serializables.
+    Se reconstruye el traductor usando una configuración mínima en formato JSON.
+    """
+    # Convertir el JSON a diccionario
+    config = json.loads(config_json)
+    # Crear una instancia del traductor localmente en el worker
+    translator = OpenAITranslator(config)
+    # Realizar la traducción
+    return translator.translate(text, source_language, target_language)
 
 
 class AbstractTranslator(ABC):
@@ -331,36 +344,42 @@ class TranslationManager:
             
         # Create an output dataframe starting with the original data
         processed_df = df
-        
-        # Register UDF for translation
-        translate_udf = F.udf(self._translate_with_language, StringType())
-        
+
+        # Extrae los valores que necesitas para evitar capturar 'self'
+        target_language = self.target_language
+        config_json = json.dumps(self.config)  # Esto ya es un string, sin referencias a self
+
+        # Define el UDF usando la función global (que ya definiste previamente)
+        translate_udf = F.udf(
+            lambda text, src_lang: translate_text_global(text, src_lang, target_language, config_json),
+            StringType()
+        )
+
         for column in self.columns_to_translate:
             # Check if column exists
             if column not in df.columns:
                 self.logger.warning(f"Column '{column}' not found in dataframe, skipping")
                 continue
-                
+
             # Generate the output column name
-            output_column = f"{column}_{self.target_language}"
-            
+            output_column = f"{column}_{target_language}"
+
             # Apply translation UDF
             if self.source_language_column and self.source_language_column in df.columns:
-                # Use specified source language column
                 self.logger.info(f"Translating column '{column}' using language from '{self.source_language_column}'")
                 processed_df = processed_df.withColumn(
                     output_column,
                     translate_udf(F.col(column), F.col(self.source_language_column))
                 )
             else:
-                # Use auto-detection for source language
                 self.logger.info(f"Translating column '{column}' with auto language detection")
                 processed_df = processed_df.withColumn(
                     output_column,
                     translate_udf(F.col(column), F.lit("auto"))
                 )
-        
+
         return processed_df
+
     
     def _translate_with_language(self, text: str, source_language: str) -> str:
         """
