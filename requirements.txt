@@ -5,7 +5,7 @@ pandas==2.0.3
 numpy==1.24.4
 
 # For Stata file support
-pyreadstat==1.2.2
+pyreadstat==1.2.8
 
 # For configuration management
 pyyaml==6.0.1
