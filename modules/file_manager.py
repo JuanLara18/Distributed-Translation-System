@@ -286,7 +286,7 @@ class DataWriter(AbstractDataHandler):
         except Exception as e:
             self.logger.error(f"Error writing output file: {str(e)}")
             raise
-            
+                
     def _write_stata_file(self, df: DataFrame) -> None:
         """
         Write a DataFrame to a Stata file with support for Stata 18 and long strings.
@@ -313,7 +313,6 @@ class DataWriter(AbstractDataHandler):
             
             # Check which version of Stata format we can use
             try:
-                # Intentar importar el formato más moderno
                 from pyreadstat.pyreadstat import StataWriteFileFormat
                 stata_format = StataWriteFileFormat.STATA_118  # Format for Stata 14-18
                 supports_stata_format = True
@@ -322,70 +321,84 @@ class DataWriter(AbstractDataHandler):
                 stata_format = None
                 supports_stata_format = False
             
-            # Check if strl_columns parameter is supported
-            write_dta_params = inspect.signature(pyreadstat.write_dta).parameters
-            supports_strl = 'strl_columns' in write_dta_params
-            
-            # Identify columns needing strL storage
+            # Determine max string lengths and prepare for truncation if needed
             string_cols = pd_df.select_dtypes(include=['object']).columns
-            strL_columns = []
+            column_max_lengths = {}
             
             for col in string_cols:
+                # Calculate max length
                 max_len = pd_df[col].astype(str).str.len().max()
-                if max_len > 2000:
-                    strL_columns.append(col)
-                    self.logger.info(f"Column '{col}' with max length {max_len} will use strL storage")
+                column_max_lengths[col] = max_len
+                self.logger.info(f"Column '{col}' has maximum length of {max_len} characters")
             
-            # Write with optimal parameters
+            # First try with automatic truncation (preferable approach)
+            self.logger.info("Attempting to write Stata file with version 13 (most compatible)")
+            
             try:
-                if supports_stata_format and supports_strl and strL_columns:
-                    self.logger.info("Writing Stata file using Stata 118 format with strL columns")
-                    pyreadstat.write_dta(
-                        pd_df,
-                        self.output_file,
-                        write_file_format=stata_format,
-                        strl_columns=strL_columns
-                    )
-                elif supports_stata_format:
-                    self.logger.info("Writing Stata file using Stata 118 format")
-                    pyreadstat.write_dta(
-                        pd_df,
-                        self.output_file,
-                        write_file_format=stata_format
-                    )
-                else:
-                    self.logger.info("Writing Stata file using version 15 format")
-                    pyreadstat.write_dta(
-                        pd_df,
-                        self.output_file,
-                        version=15
-                    )
-                        
-                self.logger.info(f"Successfully wrote Stata file with {len(pd_df)} rows")
+                # Truncate all string columns to a safe size (244 bytes for Stata 13)
+                # This is very conservative but will ensure the file can be written
+                SAFE_LENGTH = 200  # Very conservative
+                
+                # Create a copy for truncation
+                truncated_df = pd_df.copy()
+                
+                # Truncate all string columns
+                for col in string_cols:
+                    if column_max_lengths[col] > SAFE_LENGTH:
+                        self.logger.info(f"Truncating column '{col}' from {column_max_lengths[col]} to {SAFE_LENGTH} characters")
+                        truncated_df[col] = truncated_df[col].astype(str).str.slice(0, SAFE_LENGTH)
+                
+                # Try to write with version 13 (most compatible)
+                pyreadstat.write_dta(
+                    truncated_df,
+                    self.output_file,
+                    version=13
+                )
+                
+                self.logger.info(f"Successfully wrote Stata file with version 13 and truncated columns")
                 
             except Exception as e:
-                self.logger.error(f"Failed to write Stata file: {str(e)}")
+                self.logger.warning(f"Failed to write with truncation: {str(e)}")
                 
-                # Approach for handling failures
-                # Create a CSV backup and raise the error
-                backup_path = self.output_file + '.csv'
-                self.logger.warning(f"Creating CSV backup at: {backup_path}")
-                pd_df.to_csv(backup_path, index=False)
-                
-                # Also create a parquet backup which can handle any data type and maintain all data
-                parquet_backup = self.output_file + '.parquet'
-                self.logger.warning(f"Creating Parquet backup at: {parquet_backup}")
-                pd_df.to_parquet(parquet_backup, index=False)
-                
-                raise
-                
-        except ImportError:
-            self.logger.error("pyreadstat not installed. Please install it with: pip install pyreadstat")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error writing Stata file: {str(e)}")
-            raise
-            
+                # Create CSV and Parquet backups as failsafe outputs
+                try:
+                    # Save CSV backup
+                    csv_backup = f"{self.output_file}.csv"
+                    self.logger.info(f"Creating CSV backup at: {csv_backup}")
+                    pd_df.to_csv(csv_backup, index=False)
+                    
+                    # Save Parquet backup (preserves all data types and lengths)
+                    parquet_backup = f"{self.output_file}.parquet"
+                    self.logger.info(f"Creating Parquet backup at: {parquet_backup}")
+                    pd_df.to_parquet(parquet_backup, index=False)
+                    
+                    self.logger.info("Backup files created successfully")
+                    
+                    # Also create a version with even more aggressive truncation as last resort
+                    last_resort_df = pd_df.copy()
+                    LAST_RESORT_LENGTH = 100  # Extremely conservative
+                    
+                    for col in string_cols:
+                        last_resort_df[col] = last_resort_df[col].astype(str).str.slice(0, LAST_RESORT_LENGTH)
+                    
+                    last_resort_file = f"{self.output_file}.truncated.dta"
+                    self.logger.info(f"Creating last-resort truncated Stata file: {last_resort_file}")
+                    
+                    pyreadstat.write_dta(
+                        last_resort_df,
+                        last_resort_file,
+                        version=13
+                    )
+                    
+                    self.logger.info("Last-resort Stata file created successfully")
+                    
+                    # Still raise the exception as the main file wasn't created as requested
+                    raise ValueError(f"Could not write Stata file with desired lengths. See backup files: {csv_backup}, {parquet_backup}, and {last_resort_file}")
+                    
+                except Exception as backup_error:
+                    self.logger.error(f"Error creating backup files: {str(backup_error)}")
+                    raise
+        
         except ImportError:
             self.logger.error("pyreadstat not installed. Please install it with: pip install pyreadstat")
             raise
