@@ -8,7 +8,7 @@ Handles translation of text using various translation services.
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional, Tuple, Set
+from typing import Dict, List, Any, Optional, Tuple, Set, Union
 import logging
 import concurrent.futures
 from functools import partial
@@ -176,13 +176,13 @@ class OpenAITranslator(AbstractTranslator):
             # For persistent errors, return original text as fallback
             raise
     
-    def batch_translate(self, texts: List[str], source_language: str, target_language: str) -> List[str]:
+    def batch_translate(self, texts: List[str], source_languages: Union[List[str], str], target_language: str) -> List[str]:
         """
         Translate a batch of texts using parallel processing.
         
         Args:
             texts: List of texts to translate
-            source_language: Source language code
+            source_languages: Either a list of source languages (one per text) or a single language for all texts
             target_language: Target language code
             
         Returns:
@@ -204,28 +204,40 @@ class OpenAITranslator(AbstractTranslator):
                 original_to_filtered[i] = filtered_index
                 filtered_index += 1
         
+        # Handle source_languages parameter - make it a list if it's a string
+        if isinstance(source_languages, str):
+            source_langs = [source_languages] * len(filtered_texts)
+        else:
+            # If it's already a list, make sure it has entries for each filtered text
+            filtered_langs = []
+            for i, text in enumerate(texts):
+                if text and text.strip():
+                    filtered_langs.append(source_languages[i])
+            source_langs = filtered_langs
+        
         # Normalize language codes
-        source_language = get_normalized_language_code(source_language)
+        source_langs = [get_normalized_language_code(lang) for lang in source_langs]
         target_language = get_normalized_language_code(target_language)
         
         # Use ThreadPoolExecutor for parallel processing
-        max_workers = min(len(filtered_texts), os.cpu_count() * 2 or 2)
+        max_workers = min(len(filtered_texts), os.cpu_count() * 3 or 2)  # Increased multiplier for better concurrency
         results = [""] * len(texts)
         
-        translate_func = partial(self.translate, 
-                                source_language=source_language, 
-                                target_language=target_language)
+        # Create a list of translation tasks
+        translation_tasks = []
+        for i, (text, lang) in enumerate(zip(filtered_texts, source_langs)):
+            translation_tasks.append((i, text, lang))
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all translation tasks
-            future_to_index = {
-                executor.submit(translate_func, text): i 
-                for i, text in enumerate(filtered_texts)
-            }
+            future_to_task = {}
+            for idx, text, lang in translation_tasks:
+                future = executor.submit(self.translate, text, lang, target_language)
+                future_to_task[future] = (idx, text)
             
             # Process results as they complete
-            for future in concurrent.futures.as_completed(future_to_index):
-                filtered_index = future_to_index[future]
+            for future in concurrent.futures.as_completed(future_to_task):
+                filtered_index, original_text = future_to_task[future]
                 
                 try:
                     translation = future.result()
@@ -245,7 +257,7 @@ class OpenAITranslator(AbstractTranslator):
                             results[orig_idx] = texts[orig_idx]
         
         return results
-    
+
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
         Generates a concise system prompt for general translation.
@@ -410,37 +422,27 @@ class TranslationManager:
                             langs_to_translate.append(lang)
                     
                     # Only call API if we have texts to translate
-                    if texts_to_translate:
-                        self.logger.info(f"Translating {len(texts_to_translate)} texts via API for column '{column}'")
+                    try:
+                        # Use batch_translate to parallel process all texts
+                        api_results = self.translator.batch_translate(texts_to_translate, langs_to_translate, self.target_language)
                         
-                        # Translate texts not in cache
-                        try:
-                            api_results = []
-                            for text, lang in zip(texts_to_translate, langs_to_translate):
-                                try:
-                                    translation = self.translator.translate(text, lang, self.target_language)
-                                    self.stats['api_calls'] += 1
-                                    self.stats['translated_rows'] += 1
-                                    api_results.append(translation)
-                                    
-                                    # Add to cache
-                                    self.cache_manager.set(text, lang, self.target_language, translation)
-                                except Exception as e:
-                                    self.logger.error(f"Error translating text: {str(e)}")
-                                    self.stats['errors'] += 1
-                                    # Use the original text as fallback
-                                    api_results.append(text)
+                        # Update stats once for the whole batch
+                        self.stats['api_calls'] += len(texts_to_translate)
+                        self.stats['translated_rows'] += len(texts_to_translate)
+                        
+                        # Add to cache and results
+                        for idx, text in enumerate(texts_to_translate):
+                            translation = api_results[idx]
+                            batch_cache_results[text] = translation
+                            self.cache_manager.set(text, langs_to_translate[idx], self.target_language, translation)
                             
-                            # Add API results to batch results
-                            for text, translation in zip(texts_to_translate, api_results):
-                                batch_cache_results[text] = translation
-                        except Exception as e:
-                            self.logger.error(f"Batch translation error: {str(e)}")
-                            # Use original texts as fallback for any failures
-                            for text in texts_to_translate:
-                                if text not in batch_cache_results:
-                                    batch_cache_results[text] = text
-                                    self.stats['errors'] += 1
+                    except Exception as e:
+                        self.logger.error(f"Batch translation error: {str(e)}")
+                        # Use original texts as fallback for any failures
+                        for text in texts_to_translate:
+                            if text not in batch_cache_results:
+                                batch_cache_results[text] = text
+                                self.stats['errors'] += 1
                     
                     # Add batch results to all translations
                     translations.update(batch_cache_results)
@@ -502,37 +504,30 @@ class TranslationManager:
                     texts_to_translate = [text for text in batch_texts if text not in batch_cache_results]
                     
                     # Only call API if we have texts to translate
-                    if texts_to_translate:
-                        self.logger.info(f"Translating {len(texts_to_translate)} texts via API for column '{column}'")
+                    try:
+                        # Create a list of "auto" source languages, one for each text
+                        auto_langs = ["auto"] * len(texts_to_translate)
                         
-                        # Translate texts not in cache
-                        try:
-                            api_results = []
-                            for text in texts_to_translate:
-                                try:
-                                    translation = self.translator.translate(text, "auto", self.target_language)
-                                    self.stats['api_calls'] += 1
-                                    self.stats['translated_rows'] += 1
-                                    api_results.append(translation)
-                                    
-                                    # Add to cache
-                                    self.cache_manager.set(text, "auto", self.target_language, translation)
-                                except Exception as e:
-                                    self.logger.error(f"Error translating text: {str(e)}")
-                                    self.stats['errors'] += 1
-                                    # Use the original text as fallback
-                                    api_results.append(text)
+                        # Use batch_translate to parallel process all texts
+                        api_results = self.translator.batch_translate(texts_to_translate, auto_langs, self.target_language)
+                        
+                        # Update stats once for the whole batch
+                        self.stats['api_calls'] += len(texts_to_translate)
+                        self.stats['translated_rows'] += len(texts_to_translate)
+                        
+                        # Add to cache and results
+                        for idx, text in enumerate(texts_to_translate):
+                            translation = api_results[idx]
+                            batch_cache_results[text] = translation
+                            self.cache_manager.set(text, "auto", self.target_language, translation)
                             
-                            # Add API results to batch results
-                            for text, translation in zip(texts_to_translate, api_results):
-                                batch_cache_results[text] = translation
-                        except Exception as e:
-                            self.logger.error(f"Batch translation error: {str(e)}")
-                            # Use original texts as fallback for any failures
-                            for text in texts_to_translate:
-                                if text not in batch_cache_results:
-                                    batch_cache_results[text] = text
-                                    self.stats['errors'] += 1
+                    except Exception as e:
+                        self.logger.error(f"Batch translation error: {str(e)}")
+                        # Use original texts as fallback for any failures
+                        for text in texts_to_translate:
+                            if text not in batch_cache_results:
+                                batch_cache_results[text] = text
+                                self.stats['errors'] += 1
                     
                     # Add batch results to all translations
                     translations.update(batch_cache_results)
