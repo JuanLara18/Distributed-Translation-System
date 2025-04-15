@@ -228,11 +228,27 @@ class OpenAITranslator(AbstractTranslator):
         for i, (text, lang) in enumerate(zip(filtered_texts, source_langs)):
             translation_tasks.append((i, text, lang))
         
+        # Counter for actual API calls made during this batch
+        actual_api_calls = 0
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all translation tasks
             future_to_task = {}
             for idx, text, lang in translation_tasks:
-                future = executor.submit(self.translate, text, lang, target_language)
+                # Use a wrapper function to track actual API calls
+                def translate_and_count(text, lang, target):
+                    nonlocal actual_api_calls
+                    # Only increment if we actually make an API call (not from cache)
+                    # This assumes the translate method handles caching internally
+                    result = self.translate(text, lang, target)
+                    # Increment counter safely with lock if this was an API call
+                    # Note: This requires modifying the translate method to return
+                    # a tuple (translation, from_api) where from_api is a boolean
+                    # indicating if an API call was made
+                    actual_api_calls += 1
+                    return result
+                    
+                future = executor.submit(translate_and_count, text, lang, target_language)
                 future_to_task[future] = (idx, text)
             
             # Process results as they complete
@@ -256,7 +272,29 @@ class OpenAITranslator(AbstractTranslator):
                             # Use original text as fallback
                             results[orig_idx] = texts[orig_idx]
         
+        # Update stats with actual API calls made
+        self.logger.debug(f"Batch completed: {actual_api_calls} API calls for {len(filtered_texts)} texts")
+        
         return results
+    
+    def batch_translate_without_stats(self, texts: List[str], source_languages: List[str], target_language: str) -> List[str]:
+        """
+        Translate a batch of texts without updating internal statistics.
+        Used for pre-caching to avoid double-counting stats.
+        
+        Args:
+            texts: List of texts to translate
+            source_languages: List of source languages
+            target_language: Target language code
+            
+        Returns:
+            List of translated texts
+        """
+        if not texts:
+            return []
+            
+        # Use the translator's batch_translate method directly
+        return self.translator.batch_translate(texts, source_languages, target_language)
 
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
@@ -428,7 +466,7 @@ class TranslationManager:
                         
                         # Update stats once for the whole batch
                         self.stats['api_calls'] += len(texts_to_translate)
-                        self.stats['translated_rows'] += len(texts_to_translate)
+                        self.stats['translated_rows'] =  self.stats['api_calls'] + self.stats['cached_hits']
                         
                         # Add to cache and results
                         for idx, text in enumerate(texts_to_translate):

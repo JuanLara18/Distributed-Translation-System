@@ -303,6 +303,12 @@ class DataWriter(AbstractDataHandler):
                 column_set = set(pd_df.columns)
                 variable_labels = {k: v for k, v in variable_labels.items() if k in column_set}
                 
+                max_stata_strlen = 2045  # Para Stata 13+
+                for col in pd_df.select_dtypes(include=['object']).columns:
+                    pd_df[col] = pd_df[col].astype(str).apply(
+                        lambda x: x[:max_stata_strlen] if len(x) > max_stata_strlen else x
+                    )
+
                 # Write with metadata
                 pyreadstat.write_dta(
                     pd_df,

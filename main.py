@@ -145,6 +145,87 @@ class TranslationOrchestrator:
             self.stats['total_rows'] = total_rows
             self.logger.info(f"Processing {total_rows} rows from input file")
             
+            # OPTIMIZATION: Extract all unique texts across the entire dataset
+            # to pre-populate the cache and minimize API calls
+            columns_to_translate = self.config.get('columns_to_translate', [])
+            source_language_column = self.config.get('source_language_column')
+            target_language = self.config.get('target_language', 'english')
+            
+            if not resume and columns_to_translate:
+                self.logger.info("Pre-caching unique texts from all partitions to optimize API usage")
+                all_unique_texts = {}
+                
+                # Collect data for global deduplication
+                for column in columns_to_translate:
+                    if column not in df.columns:
+                        continue
+                    
+                    self.logger.info(f"Collecting unique texts from column '{column}'")
+                    
+                    # Handle source language if specified
+                    if source_language_column and source_language_column in df.columns:
+                        # We need to consider text + language combinations
+                        text_lang_rows = df.select(column, source_language_column).distinct().collect()
+                        for row in text_lang_rows:
+                            text = row[column]
+                            lang = row[source_language_column] if row[source_language_column] else "auto"
+                            if text and isinstance(text, str) and text.strip():
+                                all_unique_texts[(text, lang)] = None
+                    else:
+                        # Use auto-detection for all texts
+                        unique_texts = df.select(column).distinct().rdd.flatMap(lambda x: x).collect()
+                        all_unique_texts.update({(text, "auto"): None for text in unique_texts 
+                                            if text and isinstance(text, str) and text.strip()})
+                
+                self.logger.info(f"Found {len(all_unique_texts)} unique text entries across all columns")
+                
+                # Process unique texts in batches to populate cache
+                if all_unique_texts:
+                    # Organize texts into batches
+                    batch_size = self.config.get('batch_size', 10)
+                    text_lang_pairs = list(all_unique_texts.keys())
+                    
+                    # Initialize counters for pre-caching
+                    precache_hits = 0
+                    precache_calls = 0
+                    
+                    for i in range(0, len(text_lang_pairs), batch_size):
+                        batch = text_lang_pairs[i:i+batch_size]
+                        self.logger.info(f"Pre-caching batch {i//batch_size + 1} of {(len(text_lang_pairs) + batch_size - 1)//batch_size}")
+                        
+                        # Check what's already in cache
+                        texts_to_translate = []
+                        langs_to_translate = []
+                        
+                        for text, lang in batch:
+                            cached = self.cache_manager.get(text, lang, target_language)
+                            if cached:
+                                precache_hits += 1
+                            else:
+                                texts_to_translate.append(text)
+                                langs_to_translate.append(lang)
+                        
+                        # Translate missing texts
+                        if texts_to_translate:
+                            try:
+                                translations = self.translation_manager.batch_translate_without_stats(
+                                    texts_to_translate, langs_to_translate, target_language
+                                )
+                                
+                                # Update cache with new translations
+                                for idx, (text, lang) in enumerate(zip(texts_to_translate, langs_to_translate)):
+                                    self.cache_manager.set(text, lang, target_language, translations[idx])
+                                
+                                precache_calls += len(texts_to_translate)
+                            except Exception as e:
+                                self.logger.error(f"Error during pre-caching: {str(e)}")
+                    
+                    self.logger.info(f"Pre-caching completed: {precache_calls} API calls, {precache_hits} cache hits")
+                    # Update global stats 
+                    self.stats['api_calls'] = precache_calls
+                    self.stats['cached_hits'] = precache_hits
+                    self.stats['translated_rows'] = precache_calls
+            
             # Determine number of partitions
             default_parallelism = self.config.get('spark', {}).get('default_parallelism', 4)
             num_partitions = self.config.get('num_partitions', default_parallelism)
