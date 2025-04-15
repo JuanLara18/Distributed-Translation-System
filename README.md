@@ -1,30 +1,64 @@
 # Distributed Translation System
 
-A scalable system for translating text columns in large datasets using OpenAI's language models with PySpark.
+A powerful and scalable solution for translating text columns in large datasets using OpenAI's language models with PySpark distributed processing.
 
-## What it does
+## What It Does
 
-This system helps you translate text columns in data files (Stata, CSV, Parquet, JSON) with these key features:
+This system allows you to translate text columns in data files (Stata, CSV, Parquet, JSON) with these key features:
 
-- **Distributed processing** with PySpark for handling large datasets
+- **Distributed processing** with PySpark for handling large datasets efficiently
 - **Smart caching** to avoid redundant API calls and reduce costs
-- **Checkpointing** to resume interrupted processes
-- **Stata file support** with preserved metadata
-- **Multiple language support** with automatic detection
+- **Fault tolerance** with checkpointing to resume interrupted processes
+- **Multiple file formats** with preserved metadata (especially for Stata files)
+- **Language detection** for automatic source language identification
+- **Batch processing** for optimized throughput
 
-## Getting started
+## Repository Structure
 
-### Prerequisites
+```
+distributed-translation/
+├── main.py                 # Main orchestrator script
+├── config.py               # Configuration management
+├── requirements.txt        # Python dependencies
+├── README.md               # This document
+└── modules/                # Core functionality modules
+    ├── __init__.py
+    ├── translator.py       # Translation logic and API integration
+    ├── cache.py            # Translation caching implementation
+    ├── checkpoint.py       # Process state management for fault tolerance
+    ├── file_manager.py     # Data I/O operations for various formats
+    └── utilities.py        # Common utility functions
+```
+
+## Architecture
+
+The system uses a modular architecture with well-defined interfaces:
+
+- **TranslationOrchestrator** (in `main.py`): Central controller coordinating all components
+- **ConfigManager** (in `config.py`): Manages configuration loading and validation
+- **TranslationManager** (in `modules/translator.py`): Manages the translation process
+- **CacheManager** (in `modules/cache.py`): Coordinates caching operations
+- **CheckpointManager** (in `modules/checkpoint.py`): Handles state persistence
+- **DataReader/DataWriter** (in `modules/file_manager.py`): Handle I/O operations
+
+The system follows a flow where:
+1. Data is read from input files
+2. Translation is applied to specified columns
+3. Results are cached to avoid redundant API calls
+4. Results are checkpointed for fault tolerance
+5. Translated data is written to output files
+
+## Prerequisites
 
 - Python 3.7+
 - Java 8+ (for PySpark)
 - OpenAI API key
 
-### Installation
+## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/distributed-translation.git
+git clone https://github.com/JuanLara18/distributed-translation.git
 cd distributed-translation
 
 # Create and activate virtual environment
@@ -35,22 +69,25 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 # Set up your API key
-echo "OPENAI_API_KEY=your-api-key-here" > .env
+export OPENAI_API_KEY=your-api-key-here
+# On Windows: set OPENAI_API_KEY=your-api-key-here
 ```
 
-### Basic usage
+## Basic Usage
 
-1. Create a simple configuration file `config.yaml`:
+1. Create a configuration file `config.yaml`:
 
 ```yaml
-input_file: "data.dta"  # Your input file (supports .dta, .csv, .parquet, .json)
-output_file: "translated_data.dta"
+input_file: "data/input.dta"  # Supports .dta, .csv, .parquet, .json
+output_file: "data/output.dta"
 columns_to_translate: ["text_column1", "text_column2"]
 target_language: "english"
 
 openai:
-  model: "gpt-3.5-turbo"
-  api_key_env: "OPENAI_API_KEY"  # Uses key from .env file
+  model: "gpt-3.5-turbo"  # Or any supported OpenAI model
+  temperature: 0.1
+  max_tokens: 1500
+  api_key_env: "OPENAI_API_KEY"
 ```
 
 2. Run the translation process:
@@ -59,9 +96,30 @@ openai:
 python main.py --config config.yaml
 ```
 
-## Configuration options
+## Command-line Options
 
-### Essential settings
+The script supports several command-line options to override configuration:
+
+```bash
+# Basic usage
+python main.py --config config.yaml
+
+# Override configuration settings
+python main.py --config config.yaml --input_file new_input.dta --target_language spanish
+
+# Resume from checkpoint after interruption
+python main.py --config config.yaml --resume
+
+# Force restart (ignore existing checkpoints)
+python main.py --config config.yaml --force_restart
+
+# Enable verbose logging
+python main.py --config config.yaml --verbose
+```
+
+## Configuration Options
+
+### Essential Settings
 
 | Setting | Description | Example |
 |---------|-------------|---------|
@@ -71,7 +129,7 @@ python main.py --config config.yaml
 | `target_language` | Language to translate into | `"english"` |
 | `source_language_column` | Column containing source languages (optional) | `"language_col"` |
 
-### OpenAI settings
+### OpenAI Settings
 
 ```yaml
 openai:
@@ -81,7 +139,7 @@ openai:
   api_key_env: "OPENAI_API_KEY"
 ```
 
-### Performance tuning
+### Performance Tuning
 
 ```yaml
 # For smaller datasets (<100MB)
@@ -99,7 +157,9 @@ spark:
   default_parallelism: 8
 ```
 
-### Caching options
+### Caching Options
+
+Caching significantly improves performance and reduces API costs by storing translations:
 
 ```yaml
 cache:
@@ -115,7 +175,9 @@ cache:
   connection_string: "postgresql://user:password@localhost/translations"
 ```
 
-### Checkpoint settings
+### Checkpoint Settings
+
+Checkpointing enables fault tolerance and the ability to resume interrupted processes:
 
 ```yaml
 checkpoint:
@@ -125,28 +187,9 @@ checkpoint:
   max_checkpoints: 5
 ```
 
-## Command-line options
+## How the Translation Process Works
 
-```bash
-# Basic usage
-python main.py --config config.yaml
-
-# Override configuration
-python main.py --config config.yaml --input_file new_input.dta --target_language spanish
-
-# Resume from checkpoint
-python main.py --config config.yaml --resume
-
-# Force restart (ignore checkpoints)
-python main.py --config config.yaml --force_restart
-
-# Enable verbose logging
-python main.py --config config.yaml --verbose
-```
-
-## How translations are processed
-
-1. The system reads your input file and splits it into partitions
+1. The system reads your input file and splits it into partitions for distributed processing
 2. For each text column to translate:
    - First checks if the translation is already in the cache
    - If not cached, sends text to OpenAI's API
@@ -154,16 +197,65 @@ python main.py --config config.yaml --verbose
 3. Translations are added as new columns with `_[target_language]` suffix
 4. The processed data is written to your output file
 
+## Advanced Topics
+
+### Working with Large Datasets
+
+For large datasets, consider:
+
+1. **Increasing partitions**: Set higher `default_parallelism` in Spark config
+2. **Using checkpointing**: Enable checkpoints to resume after interruptions
+3. **PostgreSQL cache**: For multi-node setups, use a central PostgreSQL cache instead of SQLite
+
+Example configuration for large datasets:
+
+```yaml
+spark:
+  executor_memory: "10g"
+  driver_memory: "8g"
+  executor_cores: 6
+  default_parallelism: 12
+
+cache:
+  type: "postgres"
+  connection_string: "postgresql://user:password@centraldb/translations"
+
+checkpoint:
+  enabled: true
+  interval: 2
+  directory: "/shared/checkpoints"
+```
+
+### Supporting Stata Files
+
+The system includes special support for Stata (.dta) files:
+
+- Preserves variable labels and value labels
+- Handles metadata correctly
+- Supports different Stata versions (13-18)
+
+### Custom Language Detection
+
+If the `source_language_column` is not specified, the system automatically detects source languages, but you can customize detection behavior:
+
+```yaml
+# Automatic detection (default)
+source_language_column: null
+
+# Use a specific column for source language
+source_language_column: "language_code"
+```
+
 ## Troubleshooting
 
-### Common errors
+### Common Issues
 
-- **API Key issues**: Make sure your OpenAI API key is set in your `.env` file
+- **API Key issues**: Make sure your OpenAI API key is set in your environment
 - **Memory errors**: Reduce `batch_size` or increase `spark.executor_memory`
 - **Missing translations**: Verify source language detection or specify a source language column
 - **Corrupted checkpoints**: Use `--force_restart` to start fresh
 
-### Enabling debug mode
+### Enabling Debug Mode
 
 ```yaml
 logging:
@@ -171,9 +263,31 @@ logging:
   log_file: "debug.log"
 ```
 
+## Performance Optimization
+
+1. **Caching Strategy**: 
+   - Use SQLite for single-machine processing
+   - Use PostgreSQL for distributed setups
+   - Consider memory cache only for small datasets
+
+2. **Batch Size Tuning**:
+   - Start with `batch_size: 10`
+   - Decrease for large texts, increase for short texts
+
+3. **Spark Configuration**:
+   - Increase parallelism for more concurrent processing
+   - Allocate sufficient memory to avoid OOM errors
+
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a pull request.
+Contributions are welcome! Please feel free to submit a pull request or open an issue.
+
+To contribute:
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
