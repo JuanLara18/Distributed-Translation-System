@@ -117,6 +117,8 @@ def create_spark_session(app_name: str = "distributed_translation",
     builder = builder.config("spark.sql.shuffle.partitions", str(spark_config.get("default_parallelism") * 2))
     builder = builder.config("spark.driver.extraJavaOptions", "-XX:+UseG1GC")
     builder = builder.config("spark.executor.extraJavaOptions", "-XX:+UseG1GC")
+    builder = builder.config("spark.executor.extraJavaOptions", "-XX:MaxMetaspaceSize=512m")
+    builder = builder.config("spark.driver.extraJavaOptions", "-XX:MaxMetaspaceSize=512m")
     
     # Create and return the session
     spark = builder.getOrCreate()
