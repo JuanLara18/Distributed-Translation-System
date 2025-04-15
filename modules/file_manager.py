@@ -273,7 +273,7 @@ class DataWriter(AbstractDataHandler):
     
     def _write_stata_file(self, df: DataFrame) -> None:
         """
-        Write a DataFrame to a Stata file.
+        Write a DataFrame to a Stata file with support for Stata 18 and long strings.
         
         Args:
             df: DataFrame to write
@@ -292,6 +292,27 @@ class DataWriter(AbstractDataHandler):
             
             self.logger.debug(f"Writing Stata file with pyreadstat: {self.output_file}")
             
+            # Import the StataWriteFileFormat enum to use the most recent format
+            # This will support longer strings (up to 2 billion characters for strL)
+            try:
+                # Try to import directly from pyreadstat
+                from pyreadstat.pyreadstat import StataWriteFileFormat
+                stata_format = StataWriteFileFormat.STATA_118  # Format for Stata 14-18
+            except (ImportError, AttributeError):
+                # Fallback import for older versions
+                self.logger.warning("Could not import StataWriteFileFormat; using version number directly")
+                stata_format = None  # Will use version 15 below
+            
+            # Identify columns that should be stored as strL for long strings
+            # Stata 14+ (format 118) supports up to 2,000,000 characters in strL variables
+            strl_columns = []
+            for col in pd_df.select_dtypes(include=['object']).columns:
+                # Check if the column has any strings longer than 2045 (standard limit)
+                max_len = pd_df[col].astype(str).str.len().max()
+                if max_len > 2045:
+                    strl_columns.append(col)
+                    self.logger.info(f"Column '{col}' contains strings longer than 2045 chars (max: {max_len}), marking as strL")
+            
             # Write the Stata file with metadata if available
             if metadata:
                 # Extract metadata components
@@ -303,24 +324,46 @@ class DataWriter(AbstractDataHandler):
                 column_set = set(pd_df.columns)
                 variable_labels = {k: v for k, v in variable_labels.items() if k in column_set}
                 
-                max_stata_strlen = 2045  # Para Stata 13+
-                for col in pd_df.select_dtypes(include=['object']).columns:
-                    pd_df[col] = pd_df[col].astype(str).apply(
-                        lambda x: x[:max_stata_strlen] if len(x) > max_stata_strlen else x
+                # Write with metadata using the most recent format
+                if stata_format:
+                    pyreadstat.write_dta(
+                        pd_df,
+                        self.output_file,
+                        file_label=file_label,
+                        variable_labels=variable_labels,
+                        value_labels=value_labels,
+                        write_file_format=stata_format,
+                        variable_format=None,  # Let pyreadstat determine formats
+                        strl_columns=strl_columns
                     )
-
-                # Write with metadata
-                pyreadstat.write_dta(
-                    pd_df,
-                    self.output_file,
-                    file_label=file_label,
-                    variable_labels=variable_labels,
-                    value_labels=value_labels
-                )
+                else:
+                    # Fallback for older pyreadstat versions
+                    pyreadstat.write_dta(
+                        pd_df,
+                        self.output_file,
+                        file_label=file_label,
+                        variable_labels=variable_labels,
+                        value_labels=value_labels,
+                        version=15,  # Highest version in older pyreadstat
+                        strl_columns=strl_columns
+                    )
             else:
                 # Write without metadata
-                pyreadstat.write_dta(pd_df, self.output_file)
-                
+                if stata_format:
+                    pyreadstat.write_dta(
+                        pd_df,
+                        self.output_file,
+                        write_file_format=stata_format,
+                        strl_columns=strl_columns
+                    )
+                else:
+                    pyreadstat.write_dta(
+                        pd_df,
+                        self.output_file,
+                        version=15,
+                        strl_columns=strl_columns
+                    )
+            
             self.logger.info(f"Successfully wrote Stata file with {len(pd_df)} rows")
             
         except ImportError:
@@ -329,7 +372,7 @@ class DataWriter(AbstractDataHandler):
         except Exception as e:
             self.logger.error(f"Error writing Stata file: {str(e)}")
             raise
-    
+
     def _load_stata_metadata(self, input_file: Optional[str]) -> Dict[str, Any]:
         """
         Load Stata metadata from a JSON file.

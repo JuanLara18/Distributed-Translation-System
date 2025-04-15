@@ -621,16 +621,78 @@ class TranslationManager:
         # Create an output dataframe starting with the original data
         output_df = df
         
-        # Define a UDF that only uses the cache (no API calls)
+        # Serialize necessary configuration for cache access
+        cache_config = self.config.get('cache', {})
+        target_language = self.target_language
+        
+        # Convert to JSON for serialization
+        config_json = json.dumps({
+            'cache': cache_config,
+            'target_language': target_language
+        })
+        
+        # Define a UDF that creates its own cache connection
         def get_cached_translation(text: str, source_language: str) -> str:
             if not text or not text.strip():
                 return ""
+            
+            # Import necessary modules within the function 
+            # so they're available on worker nodes
+            import json
+            import sqlite3
+            import os
+            import time
+            import hashlib
+            
+            # Parse configuration
+            config = json.loads(config_json)
+            target_lang = config.get('target_language', 'english')
+            cache_config = config.get('cache', {})
+            cache_location = cache_config.get('location', './cache/translations.db')
+            ttl = cache_config.get('ttl', 2592000)  # Default 30 days
+            
+            # Create connection inside the function
+            try:
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(os.path.abspath(cache_location)), exist_ok=True)
                 
-            cached = self.cache_manager.get(text, source_language, self.target_language)
-            if cached:
-                return cached
-            return text  # Return original if not in cache
+                # Connect to the database
+                conn = sqlite3.connect(cache_location, check_same_thread=False, timeout=30.0)
+                cursor = conn.cursor()
+                
+                # Generate a unique ID for the entry
+                key = f"{source_language}:{target_lang}:{text}"
+                entry_id = hashlib.md5(key.encode('utf-8')).hexdigest()
+                
+                # Check if translation exists in cache
+                current_time = int(time.time())
+                expiry_time = current_time - ttl
+                
+                cursor.execute(
+                    '''
+                    SELECT translation FROM translations 
+                    WHERE id = ? AND timestamp > ?
+                    ''',
+                    (entry_id, expiry_time)
+                )
+                
+                result = cursor.fetchone()
+                
+                # Close connection
+                cursor.close()
+                conn.close()
+                
+                if result:
+                    return result[0]
+                
+                # Return original if not in cache
+                return text
+                
+            except Exception:
+                # Return original text on any error
+                return text
         
+        # Create the UDF
         get_cached_udf = F.udf(get_cached_translation, StringType())
         
         # Apply translations from cache
@@ -652,7 +714,7 @@ class TranslationManager:
                 )
         
         return output_df
-    
+
     def batch_translate_without_stats(self, texts: List[str], source_languages: List[str], target_language: str) -> List[str]:
         """
         Translate a batch of texts without updating internal statistics.
