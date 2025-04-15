@@ -286,7 +286,7 @@ class DataWriter(AbstractDataHandler):
         except Exception as e:
             self.logger.error(f"Error writing output file: {str(e)}")
             raise
-                
+
     def _write_stata_file(self, df: DataFrame) -> None:
         """
         Write a DataFrame to a Stata file with support for Stata 18 and long strings.
@@ -308,6 +308,19 @@ class DataWriter(AbstractDataHandler):
             # Load metadata if available
             input_file = self.config.get('input_file')
             metadata = self._load_stata_metadata(input_file)
+            
+            # Extract variable labels from metadata if they exist
+            variable_labels = metadata.get('variable_labels', {})
+            
+            # Update variable labels for translated columns (we'll handle this later if supported)
+            for original_col in self.columns_to_translate:
+                if original_col in variable_labels:
+                    translated_col = f"{original_col}_{self.target_language}"
+                    if translated_col in pd_df.columns:
+                        # If original column had a label, create a similar one for the translated column
+                        original_label = variable_labels[original_col]
+                        variable_labels[translated_col] = f"{original_label} ({self.target_language})"
+                        self.logger.debug(f"Added label for translated column: {translated_col}")
             
             self.logger.debug(f"Writing Stata file with pyreadstat: {self.output_file}")
             
@@ -331,6 +344,15 @@ class DataWriter(AbstractDataHandler):
                 column_max_lengths[col] = max_len
                 self.logger.info(f"Column '{col}' has maximum length of {max_len} characters")
             
+            # Check if write_dta supports variable_labels
+            write_dta_args = inspect.getfullargspec(pyreadstat.write_dta).args
+            supports_variable_labels = 'variable_labels' in write_dta_args
+            
+            # If variable_labels is not supported but we need to apply labels, we use metadata method
+            if not supports_variable_labels and variable_labels:
+                self.logger.info("Variable labels not supported directly by pyreadstat.write_dta in this version")
+                # We'll apply labels after writing the file using a different approach
+                
             # First try with automatic truncation (preferable approach)
             self.logger.info("Attempting to write Stata file with version 13 (most compatible)")
             
@@ -349,13 +371,25 @@ class DataWriter(AbstractDataHandler):
                         truncated_df[col] = truncated_df[col].astype(str).str.slice(0, SAFE_LENGTH)
                 
                 # Try to write with version 13 (most compatible)
-                pyreadstat.write_dta(
-                    truncated_df,
-                    self.output_file,
-                    version=13
-                )
-                
-                self.logger.info(f"Successfully wrote Stata file with version 13 and truncated columns")
+                if supports_variable_labels:
+                    pyreadstat.write_dta(
+                        truncated_df,
+                        self.output_file,
+                        version=13,
+                        variable_labels=variable_labels
+                    )
+                    self.logger.info(f"Successfully wrote Stata file with version 13, truncated columns, and variable labels")
+                else:
+                    pyreadstat.write_dta(
+                        truncated_df,
+                        self.output_file,
+                        version=13
+                    )
+                    self.logger.info(f"Successfully wrote Stata file with version 13 and truncated columns")
+                    
+                    # Apply labels after writing if we have them and need them
+                    if variable_labels:
+                        self._apply_stata_labels_after_write(self.output_file, variable_labels)
                 
             except Exception as e:
                 self.logger.warning(f"Failed to write with truncation: {str(e)}")
@@ -384,11 +418,23 @@ class DataWriter(AbstractDataHandler):
                     last_resort_file = f"{self.output_file}.truncated.dta"
                     self.logger.info(f"Creating last-resort truncated Stata file: {last_resort_file}")
                     
-                    pyreadstat.write_dta(
-                        last_resort_df,
-                        last_resort_file,
-                        version=13
-                    )
+                    if supports_variable_labels:
+                        pyreadstat.write_dta(
+                            last_resort_df,
+                            last_resort_file,
+                            version=13,
+                            variable_labels=variable_labels
+                        )
+                    else:
+                        pyreadstat.write_dta(
+                            last_resort_df,
+                            last_resort_file,
+                            version=13
+                        )
+                        
+                        # Apply labels after writing if we have them
+                        if variable_labels:
+                            self._apply_stata_labels_after_write(last_resort_file, variable_labels)
                     
                     self.logger.info("Last-resort Stata file created successfully")
                     
@@ -405,6 +451,62 @@ class DataWriter(AbstractDataHandler):
         except Exception as e:
             self.logger.error(f"Error writing Stata file: {str(e)}")
             raise
+
+    def _apply_stata_labels_after_write(self, file_path: str, variable_labels: Dict[str, str]) -> None:
+        """
+        Apply variable labels to a Stata file after it has been written.
+        This is a workaround for older pyreadstat versions that don't support variable_labels.
+        
+        Args:
+            file_path: Path to the Stata file
+            variable_labels: Dictionary of variable labels
+        """
+        try:
+            import pyreadstat
+            
+            self.logger.info("Applying variable labels after writing file")
+            
+            # Read the file we just wrote
+            df, meta = pyreadstat.read_dta(file_path)
+            
+            # Use the "write_file_label_and_value_labels" function if it exists
+            if hasattr(pyreadstat, 'write_file_label_and_value_labels'):
+                self.logger.info("Using write_file_label_and_value_labels function")
+                
+                # We'll try to preserve all other metadata
+                pyreadstat.write_file_label_and_value_labels(
+                    file_path, 
+                    meta.file_label, 
+                    meta.value_labels,
+                    variable_value_labels=meta.variable_value_labels,
+                    variable_labels=variable_labels
+                )
+                self.logger.info("Successfully applied variable labels")
+            else:
+                # If the function doesn't exist, try an alternative approach using pandas
+                # This could be reading the file, setting the variable labels and rewriting
+                self.logger.warning("No direct method to apply variable labels found. "
+                                "Labels will not be preserved.")
+                
+                # Try to set the variable labels in pandas and rewrite (this approach may not work well)
+                # But it's better than nothing
+                for col, label in variable_labels.items():
+                    if col in df.columns:
+                        # We need to set column attributes somehow, but pandas doesn't handle
+                        # Stata labels directly. This approach is limited.
+                        if hasattr(df, 'attrs'):
+                            if 'variable_labels' not in df.attrs:
+                                df.attrs['variable_labels'] = {}
+                            df.attrs['variable_labels'][col] = label
+                
+                # Write the file back - this may not actually preserve the labels
+                # The best approach would be to update pyreadstat
+                pyreadstat.write_dta(df, file_path, version=13)
+                self.logger.warning("Attempted to apply variable labels, but may not be successful due to library limitations")
+        
+        except Exception as e:
+            self.logger.error(f"Error applying variable labels after write: {str(e)}")
+            self.logger.warning("File was written successfully, but without variable labels")                
 
     def _load_stata_metadata(self, input_file: Optional[str]) -> Dict[str, Any]:
         """
