@@ -248,25 +248,21 @@ class OpenAITranslator(AbstractTranslator):
     
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
-        Create a system prompt for translation.
-        
+        Generates a concise system prompt for general translation.
+
         Args:
-            source_language: Source language
-            target_language: Target language
-            
+            source_language: The language of the source text.
+            target_language: The language to translate into.
+
         Returns:
-            Formatted system prompt
+            A prompt string with clear instructions to translate exactly while preserving all formatting.
         """
         return (
-            f"You are a professional translator from {source_language} to {target_language}. "
-            f"Translate the following text from {source_language} to {target_language}. "
-            f"Provide only the translated text without explanations, introductions, or notes. "
-            f"Maintain the original formatting, paragraph breaks, and style as much as possible. "
-            f"If there are any idioms, cultural references, or specific terminology, translate them "
-            f"appropriately for the target language and culture. "
-            f"If you're unsure about any specific term, translate it in the most general way possible."
+            f"You are a professional translator. Translate the text from {source_language} to {target_language} "
+            "exactly as provided, preserving formatting, punctuation, numbers, and special terms. "
+            "Do not include any explanations or extra words—return only the direct translation."
         )
-    
+
     def _clean_translation(self, text: str) -> str:
         """
         Clean the translation result by removing artifacts.
