@@ -13,6 +13,68 @@ This system allows you to translate text columns in data files (Stata, CSV, Parq
 - **Language detection** for automatic source language identification
 - **Batch processing** for optimized throughput
 
+## Prerequisites
+
+- Python 3.7+
+- Java 8+ (for PySpark)
+- OpenAI API key
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/JuanLara18/Distributed-Translation-System.git
+cd Distributed-Translation-System
+
+# Run the setup script to create directories and template files
+python setup.py
+
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Basic Usage
+
+### Step 1: Prepare Your Data
+Place your input file (Stata, CSV, Parquet, or JSON) in the `input/` directory.
+
+### Step 2: Configure the Translation
+Edit the config file at `config/config.yaml`:
+
+```yaml
+# Specify input and output files
+input_file: "./input/your_file.dta"
+output_file: "./output/your_file_translated.dta"
+
+# Specify columns to translate
+columns_to_translate: 
+  - "column_name_1"
+  - "column_name_2"
+
+# Specify source language column (optional)
+source_language_column: "language_column_name"
+
+# Specify target language
+target_language: "english"
+```
+
+### Step 3: Run the Translation
+
+```bash
+# Load your API key into the environment
+source OPENAI_KEY.env  # On Windows: set /p OPENAI_API_KEY=<OPENAI_KEY.env
+
+# Run the translation process
+python main.py --config config/config.yaml
+```
+
+### Step 4: Get Your Translated Data
+The translated output will be saved to the location specified in your config file, typically in the `output/` directory.
+
 ## Repository Structure
 
 ```
@@ -48,53 +110,6 @@ The system follows a flow where:
 4. Results are checkpointed for fault tolerance
 5. Translated data is written to output files
 
-## Prerequisites
-
-- Python 3.7+
-- Java 8+ (for PySpark)
-- OpenAI API key
-
-## Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/JuanLara18/distributed-translation.git
-cd distributed-translation
-
-# Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set up your API key
-export OPENAI_API_KEY=your-api-key-here
-# On Windows: set OPENAI_API_KEY=your-api-key-here
-```
-
-## Basic Usage
-
-1. Create a configuration file `config.yaml`:
-
-```yaml
-input_file: "data/input.dta"  # Supports .dta, .csv, .parquet, .json
-output_file: "data/output.dta"
-columns_to_translate: ["text_column1", "text_column2"]
-target_language: "english"
-
-openai:
-  model: "gpt-3.5-turbo"  # Or any supported OpenAI model
-  temperature: 0.1
-  max_tokens: 1500
-  api_key_env: "OPENAI_API_KEY"
-```
-
-2. Run the translation process:
-
-```bash
-python main.py --config config.yaml
-```
 
 ## Command-line Options
 
