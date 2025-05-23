@@ -22,33 +22,68 @@ from modules.cache import CacheManager
 from modules.checkpoint import CheckpointManager
 from modules.utilities import set_up_logging, create_spark_session, format_stats_report
 
+from modules.spark_optimizer import (
+    create_optimized_spark_session, 
+    print_system_optimization_report,
+    override_java_options_for_spark,
+    get_recommended_config_for_system,
+    detect_system_resources
+)
 
 class TranslationOrchestrator:
     """
     Main orchestrator that coordinates the entire translation process.
     """
     
-    def __init__(self, config_path: str, cli_args: Optional[Dict[str, Any]] = None):
+    def __init__(self, config_path: str, cli_args: Optional[Dict[str, Any]] = None,
+                auto_optimize: bool = True, workload_type: str = "medium"):
         """
-        Initialize the orchestrator with configuration.
+        Initialize the orchestrator with optimization.
         
         Args:
             config_path: Path to the YAML configuration file
             cli_args: Command line arguments that override config file settings
+            auto_optimize: Whether to automatically optimize Spark configuration
+            workload_type: "light", "medium", "heavy" - affects resource allocation
         """
         self.config_manager = ConfigManager(config_path, cli_args)
         self.config = self.config_manager.get_config()
+        self.auto_optimize = auto_optimize
+        self.workload_type = workload_type
         
+        # Set up logging first
         self.logger = set_up_logging(
             self.config.get('logging', {}).get('level', 'INFO'),
             self.config.get('logging', {}).get('log_file', 'translation_process.log')
         )
         
-        self.spark = create_spark_session(
-            app_name="distributed_translation",
-            config=self.config.get('spark', {})
-        )
+        # Print optimization report if requested
+        if auto_optimize:
+            self.logger.info("Generating system optimization report...")
+            print_system_optimization_report()
         
+        # Override Java options if they're too restrictive
+        java_options_override = override_java_options_for_spark()
+        if java_options_override:
+            self.logger.info(f"Recommended Java options: {java_options_override}")
+        
+        # Create optimized Spark session
+        if auto_optimize:
+            self.logger.info(f"Creating auto-optimized Spark session for {workload_type} workload...")
+            self.spark = create_optimized_spark_session(
+                app_name="distributed_translation_optimized",
+                config=self.config.get('spark'),
+                auto_optimize=True,
+                workload_type=workload_type
+            )
+        else:
+            # Use the original method if auto-optimization is disabled
+            self.spark = create_spark_session(
+                app_name="distributed_translation",
+                config=self.config.get('spark', {})
+            )
+        
+        # Initialize other components (keep your existing code)
         self.data_reader = DataReader(self.spark, self.config)
         self.data_writer = DataWriter(self.spark, self.config)
         self.cache_manager = CacheManager(self.config)
@@ -64,6 +99,51 @@ class TranslationOrchestrator:
             'start_time': None,
             'end_time': None,
         }
+
+    def _log_memory_usage(self, stage: str) -> None:
+        """Log current memory usage."""
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            memory_percent = process.memory_percent()
+            
+            self.logger.info(f"Memory usage {stage}:")
+            self.logger.info(f"  RSS: {memory_info.rss / (1024**3):.2f} GB")
+            self.logger.info(f"  VMS: {memory_info.vms / (1024**3):.2f} GB")
+            self.logger.info(f"  Percent: {memory_percent:.2f}%")
+        except Exception:
+            pass  # Don't fail if psutil is not available
+
+    def _calculate_optimal_partitions(self, total_rows: int) -> int:
+        """Calculate optimal number of partitions based on data size and system resources."""
+        # Get system info
+        try:
+            resources = detect_system_resources()
+            cpu_count = resources['cpu_logical']
+            memory_gb = resources['available_memory_gb']
+        except:
+            cpu_count = 4
+            memory_gb = 8
+        
+        # Rules of thumb for partition calculation
+        # Estimate data size (rough approximation)
+        estimated_mb_per_1k_rows = 1  # Very rough estimate
+        estimated_total_mb = (total_rows / 1000) * estimated_mb_per_1k_rows
+        
+        # Calculate partitions based on data size (target 500MB per partition)
+        data_based_partitions = max(1, int(estimated_total_mb / 500))
+        
+        # Calculate partitions based on CPU cores
+        cpu_based_partitions = cpu_count * 3  # 3x CPU cores for translation workload
+        
+        # Use the higher of the two, but cap it
+        optimal_partitions = min(max(data_based_partitions, cpu_based_partitions), cpu_count * 6)
+        
+        # Ensure it's at least 1 and not more than total_rows (if very small dataset)
+        optimal_partitions = max(1, min(optimal_partitions, total_rows))
+        
+        return optimal_partitions
     
     def initialize(self) -> bool:
         """
@@ -74,6 +154,18 @@ class TranslationOrchestrator:
         """
         try:
             self.logger.info("Initializing translation process")
+
+            # Log Spark configuration details
+            spark_conf = self.spark.sparkContext.getConf()
+            self.logger.info("Current Spark Configuration:")
+            self.logger.info(f"  Executor Memory: {spark_conf.get('spark.executor.memory', 'default')}")
+            self.logger.info(f"  Driver Memory: {spark_conf.get('spark.driver.memory', 'default')}")
+            self.logger.info(f"  Executor Cores: {spark_conf.get('spark.executor.cores', 'default')}")
+            self.logger.info(f"  Default Parallelism: {spark_conf.get('spark.default.parallelism', 'default')}")
+
+            # Add this after the other initialization code
+            # Log memory usage
+            self._log_memory_usage("After initialization")            
             
             # Validate required configuration
             if not self.config.get('input_file'):
@@ -226,9 +318,21 @@ class TranslationOrchestrator:
                     self.stats['cached_hits'] = precache_hits
                     self.stats['translated_rows'] = precache_calls
             
-            # Determine number of partitions
-            default_parallelism = self.config.get('spark', {}).get('default_parallelism', 4)
-            num_partitions = self.config.get('num_partitions', default_parallelism)
+            # Determine optimal number of partitions based on system resources
+            if hasattr(self, 'auto_optimize') and self.auto_optimize:
+                # Calculate optimal partitions based on data size and system resources
+                optimal_partitions = self._calculate_optimal_partitions(total_rows)
+                self.logger.info(f"Calculated optimal partitions: {optimal_partitions}")
+            else:
+                optimal_partitions = self.config.get('spark', {}).get('default_parallelism', 4)
+
+            # Repartition if needed
+            current_partitions = df.rdd.getNumPartitions()
+            if current_partitions != optimal_partitions:
+                self.logger.info(f"Repartitioning from {current_partitions} to {optimal_partitions} partitions")
+                df = df.repartition(optimal_partitions)
+                
+            num_partitions = optimal_partitions
             
             # Repartition if needed
             if df.rdd.getNumPartitions() != num_partitions:
@@ -461,11 +565,8 @@ class TranslationOrchestrator:
 
 
 def main():
-    """
-    Entry point for the translation process.
-    """
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Distributed Translation System')
+    """Enhanced entry point with optimization options."""
+    parser = argparse.ArgumentParser(description='Optimized Distributed Translation System')
     parser.add_argument('--config', required=True, help='Path to configuration YAML file')
     parser.add_argument('--input_file', help='Override input file path')
     parser.add_argument('--output_file', help='Override output file path')
@@ -475,12 +576,26 @@ def main():
     parser.add_argument('--force_restart', action='store_true', help='Force restart (ignore checkpoints)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     
+    # New optimization arguments
+    parser.add_argument('--no-auto-optimize', action='store_true', 
+                       help='Disable automatic Spark optimization')
+    parser.add_argument('--workload-type', choices=['light', 'medium', 'heavy'], default='medium',
+                       help='Workload type for resource allocation (default: medium)')
+    parser.add_argument('--show-recommendations', action='store_true',
+                       help='Show system optimization recommendations and exit')
+    
     args = parser.parse_args()
+    
+    # Show recommendations and exit if requested
+    if args.show_recommendations:
+        print_system_optimization_report()
+        recommendations = get_recommended_config_for_system()
+        print("\nTo use these recommendations, update your config.yaml file with the appropriate values.")
+        return
     
     # Convert args to dictionary for config overrides
     cli_args = {}
     
-    # Process explicit overrides
     if args.input_file:
         cli_args['input_file'] = args.input_file
     if args.output_file:
@@ -490,30 +605,30 @@ def main():
     if args.columns:
         cli_args['columns_to_translate'] = args.columns.split(',')
         
-    # Set log level if verbose
     if args.verbose:
         cli_args['logging'] = {'level': 'DEBUG'}
     
-    # Process resume/force_restart flags
     if args.resume:
         cli_args['resume_from_checkpoint'] = True
     if args.force_restart:
         cli_args['force_restart'] = True
         cli_args['resume_from_checkpoint'] = False
     
-    # Create and run the orchestrator
-    orchestrator = TranslationOrchestrator(args.config, cli_args)
+    # Create optimized orchestrator
+    auto_optimize = not args.no_auto_optimize
+    orchestrator = TranslationOrchestrator(
+        args.config, 
+        cli_args, 
+        auto_optimize=auto_optimize,
+        workload_type=args.workload_type
+    )
     
     try:
-        # Initialize
         if not orchestrator.initialize():
             print("Initialization failed. See log for details.")
             sys.exit(1)
         
-        # Process
         success = orchestrator.process()
-        
-        # Finalize
         orchestrator.finalize()
         
         if success:
@@ -533,7 +648,6 @@ def main():
         import traceback
         orchestrator.logger.error(traceback.format_exc())
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
