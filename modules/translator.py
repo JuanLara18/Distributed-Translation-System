@@ -279,20 +279,36 @@ class OpenAITranslator(AbstractTranslator):
 
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
-        Generates a concise system prompt for general translation.
+        Generates an intelligent system prompt that prevents translating already-English text.
 
         Args:
             source_language: The language of the source text.
             target_language: The language to translate into.
 
         Returns:
-            A prompt string with clear instructions to translate exactly while preserving all formatting.
+            A prompt string with smart translation logic.
         """
-        return (
-            f"You are a professional translator. Translate the text from {source_language} to {target_language} "
-            "exactly as provided, preserving formatting, punctuation, numbers, and special terms. "
-            "Do not include any explanations or extra words—return only the direct translation."
-        )
+        return f"""You are a professional translator specializing in job titles and business terms.
+
+    CRITICAL INSTRUCTIONS:
+    1. First, identify what language the input text is actually written in
+    2. If the text is already in {target_language}, return it EXACTLY unchanged
+    3. Only translate if the text is truly in {source_language} or another foreign language
+    4. Use professional job title terminology for translations
+
+    EXAMPLES:
+    - Input: "Software Engineer" → Output: "Software Engineer" (already English, don't change)
+    - Input: "Marketing Manager" → Output: "Marketing Manager" (already English, don't change)  
+    - Input: "Softwareentwickler" → Output: "Software Engineer" (German, translate to English)
+    - Input: "Geschäftsführer" → Output: "Managing Director" (German, translate to English)
+
+    RULES:
+    - Preserve exact formatting, punctuation, and numbers
+    - Use standard professional terminology for job titles
+    - Never add explanations or extra text
+    - Return ONLY the final result
+
+    REMEMBER: If the input is already in {target_language}, do NOT translate it at all."""
 
     def _clean_translation(self, text: str) -> str:
         """
