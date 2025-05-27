@@ -1,0 +1,96 @@
+# Distributed Translation System Configuration - QUICK FIX VERSION
+# OPTIMIZED FOR 80GB RAM + 12 CPUs
+
+#--------------------
+# FILE PATHS
+#--------------------
+input_file: "./input/HR_monthly_panel_with_language.dta"
+output_file: "./output/HR_monthly_panel_translated.dta"
+
+#--------------------
+# TRANSLATION SETTINGS
+#--------------------
+columns_to_translate: 
+ - "position_name"
+
+source_language_column: "source_language"
+target_language: "english"
+
+# Moderate batch size for stability
+batch_size: 150
+
+#--------------------
+# OPENAI API SETTINGS - UPGRADED MODEL
+#--------------------
+openai:
+ # UPGRADED: Much better model that understands context better
+ model: "gpt-4o-mini"
+ 
+ # Very low temperature for consistent results
+ temperature: 0.05
+ 
+ # Reduced tokens for job titles
+ max_tokens: 400
+ 
+ api_key_env: "OPENAI_API_KEY"
+
+#--------------------
+# CACHING SETTINGS
+#--------------------
+cache:
+ type: "sqlite"
+ location: "./cache/translations.db"
+ ttl: 7776000  # 90 days
+
+#--------------------
+# CHECKPOINT SETTINGS
+#--------------------
+checkpoint:
+ enabled: true
+ interval: 2
+ directory: "./checkpoints"
+ max_checkpoints: 10
+
+#--------------------
+# SPARK SETTINGS - CORRECTED FOR 80GB RAM + 12 CPUs
+#--------------------
+spark:
+ # FIXED: 16GB per executor (safe for 80GB system)
+ executor_memory: "16g"
+ 
+ # FIXED: 8GB for driver (was too high before)
+ driver_memory: "8g"
+ 
+ # OPTIMAL: 4 cores per executor
+ executor_cores: 4
+ 
+ # OPTIMAL: 20 parallel tasks
+ default_parallelism: 20
+
+#--------------------
+# LOGGING SETTINGS
+#--------------------
+logging:
+ level: "INFO"
+ log_file: "./logs/hr_translation_process.log"
+
+#--------------------
+# ADVANCED SETTINGS
+#--------------------
+write_intermediate_results: true
+intermediate_directory: "./intermediate"
+
+retry:
+ max_attempts: 3
+ backoff_factor: 2
+
+# Standard settings
+keep_all_columns: true
+optimize_memory: true
+resume_from_checkpoint: true
+cleanup_cache_on_completion: false
+write_stats_to_file: true
+stats_file: "./logs/hr_translation_stats.json"
+
+# Set to false to resume from existing checkpoints
+force_restart: false
