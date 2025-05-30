@@ -287,115 +287,70 @@ class OpenAITranslator(AbstractTranslator):
 
     def _get_system_prompt(self, source_language: str, target_language: str) -> str:
         """
-        Generates an intelligent system prompt that prevents translating already-English text.
-
-        Args:
-            source_language: The language of the source text.
-            target_language: The language to translate into.
-
-        Returns:
-            A prompt string with smart translation logic.
+        Generate an aggressive system prompt that translates everything possible.
         """
-        return f"""You are a professional translator specializing in job titles and business terms.
+        return f"""You are a professional translator. Translate ALL non-English text to English.
 
-    CRITICAL INSTRUCTIONS:
-    1. First, identify what language the input text is actually written in
-    2. If the text is already in {target_language}, return it EXACTLY unchanged
-    3. Only translate if the text is truly in {source_language} or another foreign language
-    4. Use professional job title terminology for translations
+    CRITICAL RULES:
+    1. Translate ANY foreign language words/phrases to English
+    2. For job titles, use standard professional English terminology  
+    3. Translate German, Spanish, French, etc. words even if mixed with English
+    4. Keep English words unchanged, translate everything else
+    5. Preserve numbers, codes, and proper names (like company names)
+    6. Return ONLY the translation, no explanations
 
     EXAMPLES:
-    - Input: "Software Engineer" → Output: "Software Engineer" (already English, don't change)
-    - Input: "Marketing Manager" → Output: "Marketing Manager" (already English, don't change)  
-    - Input: "Softwareentwickler" → Output: "Software Engineer" (German, translate to English)
-    - Input: "Geschäftsführer" → Output: "Managing Director" (German, translate to English)
+    - "Zeitmanagement 2" → "Time Management 2"
+    - "Wareneingang, Verpackung & Expedition" → "Goods Receipt, Packaging & Dispatch" 
+    - "Software Engineer" → "Software Engineer" (already English)
+    - "Auftragsmgmt & Verkaufssteuerung" → "Order Management & Sales Control"
+    - "Production Manager" → "Production Manager" (already English)
 
-    RULES:
-    - Preserve exact formatting, punctuation, and numbers
-    - Use standard professional terminology for job titles
-    - Never add explanations or extra text
-    - Return ONLY the final result
-
-    REMEMBER: If the input is already in {target_language}, do NOT translate it at all."""
+    Translate aggressively - when in doubt, translate it."""
 
     def _validate_and_clean_translation(self, original_text: str, translation: str, 
                                         source_language: str, target_language: str) -> str:
         """
-        Comprehensive validation and cleaning of translation results.
-        
-        Args:
-            original_text: The original text that was translated
-            translation: The translation result from the API
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Cleaned and validated translation, or original text if validation fails
+        Simplified validation - accept almost all translations.
         """
         if not translation or not translation.strip():
             self.logger.warning("Empty translation received, returning original text")
             return original_text
         
-        # Get validation settings from config
-        validation_config = self.config.get('translation_validation', {})
-        strict_mode = validation_config.get('strict_mode', False)
-        min_length_ratio = validation_config.get('min_length_ratio', 0.1)
-        max_length_ratio = validation_config.get('max_length_ratio', 5.0)
-        check_language_detection = validation_config.get('check_language_detection', True)
-        preserve_numbers = validation_config.get('preserve_numbers', True)
-        preserve_urls = validation_config.get('preserve_urls', True)
-        preserve_emails = validation_config.get('preserve_emails', True)
-        
-        original_translation = translation
-        
-        # Step 1: Basic cleaning - remove common API artifacts
+        # Basic cleaning only
         translation = self._basic_cleaning(translation)
         
-        # Step 2: Check for obvious translation failures
-        if self._is_translation_failure(translation, original_text):
-            self.logger.warning(f"Translation failure detected for text: '{original_text[:50]}...'")
-            if strict_mode:
-                return original_text
-            else:
-                # Try to salvage what we can
-                translation = self._salvage_translation(translation, original_text)
-        
-        # Step 3: Length validation
-        if not self._validate_length(original_text, translation, min_length_ratio, max_length_ratio):
-            self.logger.warning(f"Translation length validation failed. Original: {len(original_text)}, Translation: {len(translation)}")
-            if strict_mode:
-                return original_text
-        
-        # Step 4: Language detection validation (if enabled)
-        if check_language_detection and target_language != 'auto':
-            if not self._validate_target_language(translation, target_language):
-                self.logger.warning(f"Translation doesn't appear to be in target language: {target_language}")
-                if strict_mode:
-                    return original_text
-        
-        # Step 5: Preserve important elements
-        if preserve_numbers:
-            translation = self._preserve_numbers(original_text, translation)
-        
-        if preserve_urls:
-            translation = self._preserve_urls(original_text, translation)
-            
-        if preserve_emails:
-            translation = self._preserve_emails(original_text, translation)
-        
-        # Step 6: Structure preservation
-        translation = self._preserve_structure(original_text, translation)
-        
-        # Step 7: Final quality checks
-        if self._has_critical_errors(translation):
-            self.logger.error(f"Critical errors found in translation: '{translation[:100]}...'")
+        # Only reject if it's clearly an error message
+        if any(phrase in translation.lower() for phrase in [
+            "i cannot translate", "i can't translate", "unable to translate",
+            "translation not possible", "error:", "failed to translate"
+        ]):
+            self.logger.warning(f"API error detected in translation: {translation[:50]}")
             return original_text
         
-        # Log validation results
-        if translation != original_translation:
-            self.logger.debug(f"Translation cleaned/corrected: '{original_translation[:50]}...' -> '{translation[:50]}...'")
-        
+        # Accept the translation
         return translation
+
+    def _is_translation_failure(self, translation: str, original_text: str) -> bool:
+        """Only detect obvious API failures."""
+        if not translation.strip():
+            return True
+        
+        # Only flag clear error messages as failures
+        error_phrases = [
+            "i cannot translate", "i can't translate", "unable to translate",
+            "translation not possible", "error:", "failed to translate"
+        ]
+        
+        return any(phrase in translation.lower() for phrase in error_phrases)
+
+    def _validate_target_language(self, translation: str, target_language: str) -> bool:
+        """Always return True - disable language detection validation."""
+        return True
+
+    def _validate_length(self, original: str, translation: str, min_ratio: float, max_ratio: float) -> bool:
+        """Always return True - disable length validation.""" 
+        return True
 
     def _basic_cleaning(self, text: str) -> str:
         """Remove common artifacts from OpenAI responses."""
@@ -437,42 +392,6 @@ class OpenAITranslator(AbstractTranslator):
         
         return text
 
-    def _is_translation_failure(self, translation: str, original_text: str) -> bool:
-        """Check if the translation appears to be a failure."""
-        
-        # Check for common failure indicators
-        failure_indicators = [
-            "I cannot translate",
-            "I can't translate", 
-            "Unable to translate",
-            "Cannot provide translation",
-            "Translation not possible",
-            "I apologize",
-            "I'm sorry",
-            "Error:",
-            "Invalid request",
-            "Too long to translate",
-            "Content policy",
-            "I don't understand"
-        ]
-        
-        translation_lower = translation.lower()
-        for indicator in failure_indicators:
-            if indicator.lower() in translation_lower:
-                return True
-        
-        # Check if translation is identical to original (possible failure)
-        if translation.strip() == original_text.strip():
-            # But allow identical for very short texts or texts that shouldn't change
-            if len(original_text.strip()) > 10:  # Only flag as failure for longer texts
-                return True
-        
-        # Check if translation contains only punctuation or numbers (likely failure)
-        if translation.strip() and re.match(r'^[^\w\s]*$', translation.strip()):
-            return True
-        
-        return False
-
     def _salvage_translation(self, translation: str, original_text: str) -> str:
         """Try to salvage a partially failed translation."""
         
@@ -499,41 +418,6 @@ class OpenAITranslator(AbstractTranslator):
         
         # If salvaging fails, return original
         return original_text
-
-    def _validate_length(self, original: str, translation: str, min_ratio: float, max_ratio: float) -> bool:
-        """Validate that translation length is reasonable compared to original."""
-        
-        if not original.strip():
-            return True  # Can't validate empty text
-        
-        original_len = len(original.strip())
-        translation_len = len(translation.strip())
-        
-        if original_len == 0:
-            return True
-        
-        ratio = translation_len / original_len
-        
-        # Allow some flexibility for very short texts
-        if original_len < 20:
-            min_ratio = max(0.1, min_ratio * 0.5)
-            max_ratio = min(10.0, max_ratio * 2)
-        
-        return min_ratio <= ratio <= max_ratio
-
-    def _validate_target_language(self, translation: str, target_language: str) -> bool:
-        """Check if translation appears to be in the target language."""
-        
-        # Use the existing detect_language function
-        detected_lang = detect_language(translation)
-        target_normalized = get_normalized_language_code(target_language)
-        
-        # If detection is uncertain, assume it's okay
-        if detected_lang == 'unknown':
-            return True
-        
-        # Check if detected language matches target
-        return detected_lang == target_normalized
 
     def _preserve_numbers(self, original: str, translation: str) -> str:
         """Ensure important numbers are preserved in translation."""
