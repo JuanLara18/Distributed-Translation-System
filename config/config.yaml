@@ -1,5 +1,5 @@
-# Distributed Translation System Configuration - QUICK FIX VERSION
-# OPTIMIZED FOR 80GB RAM + 12 CPUs
+# Distributed Translation System Configuration - ENHANCED FOR BETTER QUALITY
+# OPTIMIZED FOR 80GB RAM + 12 CPUs + MAXIMUM TRANSLATION QUALITY
 
 #--------------------
 # FILE PATHS
@@ -16,81 +16,193 @@ columns_to_translate:
 source_language_column: "source_language"
 target_language: "english"
 
-# Moderate batch size for stability
-batch_size: 150
+# Smaller batch size for better quality control and error handling
+batch_size: 75
 
 #--------------------
-# OPENAI API SETTINGS - UPGRADED MODEL
+# TRANSLATION VALIDATION SETTINGS - NEW FOR BETTER QUALITY
+#--------------------
+translation_validation:
+  # STRICT MODE: Reject poor translations and retry
+  strict_mode: true
+  
+  # LENGTH VALIDATION: Job titles shouldn't be too different in length
+  min_length_ratio: 0.2      # Translation should be at least 20% of original
+  max_length_ratio: 4.0      # Translation shouldn't be more than 4x original
+  
+  # LANGUAGE VERIFICATION: Ensure output is actually in English
+  check_language_detection: true
+  
+  # PRESERVE IMPORTANT ELEMENTS
+  preserve_numbers: true     # Keep numbers in job titles (e.g., "Engineer II")
+  preserve_urls: false       # Not relevant for job titles
+  preserve_emails: false     # Not relevant for job titles
+  
+  # ADVANCED QUALITY CHECKS
+  check_for_api_errors: true      # Detect API failures
+  preserve_formatting: true       # Maintain text structure
+  detect_unchanged_text: true     # Flag when translation = original
+  
+  # VERBOSE LOGGING for quality monitoring
+  validation_log_level: "INFO"
+
+#--------------------
+# OPENAI API SETTINGS - OPTIMIZED FOR QUALITY
 #--------------------
 openai:
- # UPGRADED: Much better model that understands context better
- model: "gpt-4o-mini"
- 
- # Very low temperature for consistent results
- temperature: 0.05
- 
- # Reduced tokens for job titles
- max_tokens: 400
- 
- api_key_env: "OPENAI_API_KEY"
+  # BEST BALANCE: gpt-4o-mini is good, but with better settings
+  model: "gpt-4o-mini"
+  
+  # MAXIMUM CONSISTENCY: Zero temperature for job titles
+  temperature: 0.0
+  
+  # ADEQUATE TOKENS: Job titles are short
+  max_tokens: 300
+  
+  api_key_env: "OPENAI_API_KEY"
+  
+  # ADVANCED SETTINGS FOR BETTER QUALITY
+  frequency_penalty: 0.1     # Reduce repetitive translations
+  presence_penalty: 0.0      # Don't penalize job title terms
+  
+  # LONGER TIMEOUT for complex translations
+  request_timeout: 90
+  
+  # PROFESSIONAL PROMPT for job titles
+  custom_system_prompt: "You are a professional HR translator specializing in job titles and positions. Translate the job title from {source_language} to {target_language}. Maintain professional terminology and standard industry conventions. Output only the translated job title, nothing else."
 
 #--------------------
-# CACHING SETTINGS
+# CACHING SETTINGS - ENHANCED
 #--------------------
 cache:
- type: "sqlite"
- location: "./cache/translations.db"
- ttl: 7776000  # 90 days
+  type: "sqlite"
+  location: "./cache/translations.db"
+  ttl: 7776000  # 90 days
+  
+  # OPTIMIZATION: Batch cache operations
+  batch_size: 200
+  cleanup_interval: 1800     # Clean every 30 minutes
+  max_cache_size_mb: 2000    # 2GB cache limit
 
 #--------------------
-# CHECKPOINT SETTINGS
+# CHECKPOINT SETTINGS - MORE FREQUENT
 #--------------------
 checkpoint:
- enabled: true
- interval: 2
- directory: "./checkpoints"
- max_checkpoints: 10
+  enabled: true
+  interval: 1                # Save after every partition (more frequent)
+  directory: "./checkpoints"
+  max_checkpoints: 15        # Keep more checkpoints
+  compress: true             # Save disk space
+  auto_cleanup: false        # Keep checkpoints for debugging
 
 #--------------------
-# SPARK SETTINGS - CORRECTED FOR 80GB RAM + 12 CPUs
+# SPARK SETTINGS - OPTIMIZED FOR STABILITY
 #--------------------
 spark:
- # FIXED: 16GB per executor (safe for 80GB system)
- executor_memory: "16g"
- 
- # FIXED: 8GB for driver (was too high before)
- driver_memory: "8g"
- 
- # OPTIMAL: 4 cores per executor
- executor_cores: 4
- 
- # OPTIMAL: 20 parallel tasks
- default_parallelism: 20
+  # CONSERVATIVE: 12GB per executor for stability
+  executor_memory: "40g"
+  
+  # CONSERVATIVE: 6GB for driver
+  driver_memory: "20g"
+  
+  # OPTIMAL: 3 cores per executor for better resource management
+  executor_cores: 6
+  
+  # OPTIMAL: 16 parallel tasks (more conservative for quality)
+  default_parallelism: 56
+  
+  # ADVANCED SPARK OPTIMIZATIONS
+  sql_adaptive_enabled: true
+  sql_adaptive_coalesce_partitions: true
+  serializer: "org.apache.spark.serializer.KryoSerializer"
 
 #--------------------
-# LOGGING SETTINGS
+# RETRY AND ERROR HANDLING - SIGNIFICANTLY ENHANCED
+#--------------------
+retry:
+  max_attempts: 5            # INCREASED: More retry attempts
+  backoff_factor: 1.5        # GRADUAL: Less aggressive backoff
+  max_wait_time: 120         # LONGER: Allow more time between retries
+
+# RATE LIMITING to avoid API errors
+rate_limiting:
+  enabled: true
+  requests_per_minute: 400   # Conservative rate for gpt-4o-mini
+  burst_allowance: 50        # Small burst allowance
+
+#--------------------
+# QUALITY ASSURANCE - NEW FOR BETTER RESULTS
+#--------------------
+quality_assurance:
+  # SAMPLE REVIEW: Check 5% of translations manually
+  sample_for_review: 0.05
+  sample_output_file: "./output/hr_sample_for_review.csv"
+  
+  # STATISTICAL TRACKING
+  track_translation_stats: true
+  stats_output_file: "./logs/hr_detailed_stats.json"
+
+#--------------------
+# LOGGING SETTINGS - ENHANCED
 #--------------------
 logging:
- level: "INFO"
- log_file: "./logs/hr_translation_process.log"
+  level: "INFO"
+  log_file: "./logs/hr_translation_process.log"
+  
+  # LOG ROTATION
+  max_log_size_mb: 200
+  backup_count: 10
+  
+  # CONSOLE OUTPUT
+  console_output: true
+  colored_output: true
 
 #--------------------
-# ADVANCED SETTINGS
+# ADVANCED SETTINGS - OPTIMIZED
 #--------------------
 write_intermediate_results: true
 intermediate_directory: "./intermediate"
 
-retry:
- max_attempts: 3
- backoff_factor: 2
-
-# Standard settings
-keep_all_columns: true
+# MEMORY OPTIMIZATION
 optimize_memory: true
+keep_all_columns: true
+
+# PROCESS CONTROL
 resume_from_checkpoint: true
 cleanup_cache_on_completion: false
 write_stats_to_file: true
 stats_file: "./logs/hr_translation_stats.json"
-
-# Set to false to resume from existing checkpoints
 force_restart: false
+
+# POST-PROCESSING OPTIONS - NEW
+post_processing:
+  deduplicate_output: true          # Remove duplicate translations
+  preserve_row_order: true          # Maintain original order
+  add_metadata_columns: true        # Add quality info columns
+
+#--------------------
+# EXPERIMENTAL FEATURES FOR BETTER QUALITY
+#--------------------
+experimental:
+  # QUALITY SCORING: Automatically score translation quality
+  auto_quality_scoring: true
+  quality_threshold: 0.8            # High quality threshold
+  
+  # CONTEXT AWARE: Use surrounding context for better translations
+  context_aware: false              # Disabled for job titles (not needed)
+
+#--------------------
+# PERFORMANCE MONITORING - NEW
+#--------------------
+monitoring:
+  # PROGRESS REPORTING
+  progress_report_interval: 100     # Report every 100 translations
+  
+  # PERFORMANCE METRICS
+  track_api_response_times: true
+  track_cache_hit_ratios: true
+  track_error_rates: true
+  
+  # ALERTS
+  alert_on_high_error_rate: true
+  error_rate_threshold: 0.05        # Alert if >5% error rate

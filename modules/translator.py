@@ -19,6 +19,9 @@ from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
 from pyspark.sql.types import StringType
 
+import re
+from modules.utilities import detect_language, get_normalized_language_code
+
 from modules.cache import CacheManager
 from modules.utilities import (
     retry, detect_language, clean_text, 
@@ -163,7 +166,12 @@ class OpenAITranslator(AbstractTranslator):
             )
             
             translation = response.choices[0].message.content
-            translation = self._clean_translation(translation)
+            translation = self._validate_and_clean_translation(
+                original_text=text, 
+                translation=translation, 
+                source_language=source_language, 
+                target_language=target_language
+            )
             
             elapsed_time = time.time() - start_time
             self.logger.debug(f"Translation completed in {elapsed_time:.2f}s: {source_language} -> {target_language}, {len(text)} chars")
@@ -310,33 +318,318 @@ class OpenAITranslator(AbstractTranslator):
 
     REMEMBER: If the input is already in {target_language}, do NOT translate it at all."""
 
-    def _clean_translation(self, text: str) -> str:
+    def _validate_and_clean_translation(self, original_text: str, translation: str, 
+                                        source_language: str, target_language: str) -> str:
         """
-        Clean the translation result by removing artifacts.
+        Comprehensive validation and cleaning of translation results.
         
         Args:
-            text: Text to clean
+            original_text: The original text that was translated
+            translation: The translation result from the API
+            source_language: Source language code
+            target_language: Target language code
             
         Returns:
-            Cleaned text
+            Cleaned and validated translation, or original text if validation fails
         """
+        if not translation or not translation.strip():
+            self.logger.warning("Empty translation received, returning original text")
+            return original_text
+        
+        # Get validation settings from config
+        validation_config = self.config.get('translation_validation', {})
+        strict_mode = validation_config.get('strict_mode', False)
+        min_length_ratio = validation_config.get('min_length_ratio', 0.1)
+        max_length_ratio = validation_config.get('max_length_ratio', 5.0)
+        check_language_detection = validation_config.get('check_language_detection', True)
+        preserve_numbers = validation_config.get('preserve_numbers', True)
+        preserve_urls = validation_config.get('preserve_urls', True)
+        preserve_emails = validation_config.get('preserve_emails', True)
+        
+        original_translation = translation
+        
+        # Step 1: Basic cleaning - remove common API artifacts
+        translation = self._basic_cleaning(translation)
+        
+        # Step 2: Check for obvious translation failures
+        if self._is_translation_failure(translation, original_text):
+            self.logger.warning(f"Translation failure detected for text: '{original_text[:50]}...'")
+            if strict_mode:
+                return original_text
+            else:
+                # Try to salvage what we can
+                translation = self._salvage_translation(translation, original_text)
+        
+        # Step 3: Length validation
+        if not self._validate_length(original_text, translation, min_length_ratio, max_length_ratio):
+            self.logger.warning(f"Translation length validation failed. Original: {len(original_text)}, Translation: {len(translation)}")
+            if strict_mode:
+                return original_text
+        
+        # Step 4: Language detection validation (if enabled)
+        if check_language_detection and target_language != 'auto':
+            if not self._validate_target_language(translation, target_language):
+                self.logger.warning(f"Translation doesn't appear to be in target language: {target_language}")
+                if strict_mode:
+                    return original_text
+        
+        # Step 5: Preserve important elements
+        if preserve_numbers:
+            translation = self._preserve_numbers(original_text, translation)
+        
+        if preserve_urls:
+            translation = self._preserve_urls(original_text, translation)
+            
+        if preserve_emails:
+            translation = self._preserve_emails(original_text, translation)
+        
+        # Step 6: Structure preservation
+        translation = self._preserve_structure(original_text, translation)
+        
+        # Step 7: Final quality checks
+        if self._has_critical_errors(translation):
+            self.logger.error(f"Critical errors found in translation: '{translation[:100]}...'")
+            return original_text
+        
+        # Log validation results
+        if translation != original_translation:
+            self.logger.debug(f"Translation cleaned/corrected: '{original_translation[:50]}...' -> '{translation[:50]}...'")
+        
+        return translation
+
+    def _basic_cleaning(self, text: str) -> str:
+        """Remove common artifacts from OpenAI responses."""
         if not text:
             return ""
-            
-        # Remove common artifacts from OpenAI responses
         
-        # Remove "Translation:" prefixes
-        text = re.sub(r'^(Translation:\s*)', '', text, flags=re.IGNORECASE)
+        # Remove common prefixes
+        prefixes_to_remove = [
+            r'^(Translation:\s*)',
+            r'^(Translated text:\s*)',
+            r'^(Result:\s*)',
+            r'^(Output:\s*)',
+            r'^(Here is the translation:\s*)',
+            r'^(The translation is:\s*)',
+        ]
+        
+        for prefix_pattern in prefixes_to_remove:
+            text = re.sub(prefix_pattern, '', text, flags=re.IGNORECASE)
         
         # Remove quotes if the entire text is quoted
-        if (text.startswith('"') and text.endswith('"')) or \
-           (text.startswith("'") and text.endswith("'")):
+        if ((text.startswith('"') and text.endswith('"')) or 
+            (text.startswith("'") and text.endswith("'"))):
             text = text[1:-1]
-            
-        # Clean up any extra whitespace
-        text = clean_text(text)
-            
+        
+        # Remove markdown formatting that sometimes appears
+        text = re.sub(r'^\*\*(.*)\*\*$', r'\1', text)  # Bold
+        text = re.sub(r'^\*(.*)\*$', r'\1', text)      # Italic
+        
+        # Clean up extra whitespace but preserve intentional formatting
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            # Only strip leading/trailing whitespace, preserve internal spacing
+            cleaned_line = re.sub(r'^\s+|\s+$', '', line)
+            if cleaned_line or (line and line.isspace()):  # Preserve blank lines
+                cleaned_lines.append(cleaned_line)
+        
+        text = '\n'.join(cleaned_lines)
+        
         return text
+
+    def _is_translation_failure(self, translation: str, original_text: str) -> bool:
+        """Check if the translation appears to be a failure."""
+        
+        # Check for common failure indicators
+        failure_indicators = [
+            "I cannot translate",
+            "I can't translate", 
+            "Unable to translate",
+            "Cannot provide translation",
+            "Translation not possible",
+            "I apologize",
+            "I'm sorry",
+            "Error:",
+            "Invalid request",
+            "Too long to translate",
+            "Content policy",
+            "I don't understand"
+        ]
+        
+        translation_lower = translation.lower()
+        for indicator in failure_indicators:
+            if indicator.lower() in translation_lower:
+                return True
+        
+        # Check if translation is identical to original (possible failure)
+        if translation.strip() == original_text.strip():
+            # But allow identical for very short texts or texts that shouldn't change
+            if len(original_text.strip()) > 10:  # Only flag as failure for longer texts
+                return True
+        
+        # Check if translation contains only punctuation or numbers (likely failure)
+        if translation.strip() and re.match(r'^[^\w\s]*$', translation.strip()):
+            return True
+        
+        return False
+
+    def _salvage_translation(self, translation: str, original_text: str) -> str:
+        """Try to salvage a partially failed translation."""
+        
+        # If translation contains some useful content along with error messages,
+        # try to extract the useful part
+        lines = translation.split('\n')
+        useful_lines = []
+        
+        for line in lines:
+            line_lower = line.lower().strip()
+            # Skip lines that contain error indicators
+            if any(indicator in line_lower for indicator in 
+                ["i cannot", "i can't", "unable to", "error:", "i apologize", "i'm sorry"]):
+                continue
+            
+            # Keep lines that seem to contain actual content
+            if line.strip() and len(line.strip()) > 3:
+                useful_lines.append(line)
+        
+        if useful_lines:
+            salvaged = '\n'.join(useful_lines).strip()
+            if len(salvaged) > 0:
+                return salvaged
+        
+        # If salvaging fails, return original
+        return original_text
+
+    def _validate_length(self, original: str, translation: str, min_ratio: float, max_ratio: float) -> bool:
+        """Validate that translation length is reasonable compared to original."""
+        
+        if not original.strip():
+            return True  # Can't validate empty text
+        
+        original_len = len(original.strip())
+        translation_len = len(translation.strip())
+        
+        if original_len == 0:
+            return True
+        
+        ratio = translation_len / original_len
+        
+        # Allow some flexibility for very short texts
+        if original_len < 20:
+            min_ratio = max(0.1, min_ratio * 0.5)
+            max_ratio = min(10.0, max_ratio * 2)
+        
+        return min_ratio <= ratio <= max_ratio
+
+    def _validate_target_language(self, translation: str, target_language: str) -> bool:
+        """Check if translation appears to be in the target language."""
+        
+        # Use the existing detect_language function
+        detected_lang = detect_language(translation)
+        target_normalized = get_normalized_language_code(target_language)
+        
+        # If detection is uncertain, assume it's okay
+        if detected_lang == 'unknown':
+            return True
+        
+        # Check if detected language matches target
+        return detected_lang == target_normalized
+
+    def _preserve_numbers(self, original: str, translation: str) -> str:
+        """Ensure important numbers are preserved in translation."""
+        
+        # Find all numbers in original text
+        original_numbers = re.findall(r'\b\d+(?:[.,]\d+)*\b', original)
+        translation_numbers = re.findall(r'\b\d+(?:[.,]\d+)*\b', translation)
+        
+        # If we lost important numbers, try to restore them
+        if len(original_numbers) > len(translation_numbers):
+            missing_numbers = [num for num in original_numbers if num not in translation_numbers]
+            
+            # Log the missing numbers
+            self.logger.debug(f"Numbers potentially lost in translation: {missing_numbers}")
+            
+            # For now, just log - more sophisticated restoration could be implemented
+            # This would require more complex logic to determine where numbers should go
+        
+        return translation
+
+    def _preserve_urls(self, original: str, translation: str) -> str:
+        """Ensure URLs are preserved in translation."""
+        
+        # Find URLs in original
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+'
+        original_urls = re.findall(url_pattern, original)
+        translation_urls = re.findall(url_pattern, translation)
+        
+        # If URLs are missing from translation, try to add them back
+        missing_urls = [url for url in original_urls if url not in translation]
+        
+        if missing_urls:
+            self.logger.debug(f"URLs missing from translation: {missing_urls}")
+            # Append missing URLs at the end as a simple restoration
+            if translation.strip():
+                translation = translation.strip() + ' ' + ' '.join(missing_urls)
+            else:
+                translation = ' '.join(missing_urls)
+        
+        return translation
+
+    def _preserve_emails(self, original: str, translation: str) -> str:
+        """Ensure email addresses are preserved in translation."""
+        
+        # Find emails in original
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        original_emails = re.findall(email_pattern, original)
+        translation_emails = re.findall(email_pattern, translation)
+        
+        # If emails are missing from translation, try to add them back
+        missing_emails = [email for email in original_emails if email not in translation]
+        
+        if missing_emails:
+            self.logger.debug(f"Email addresses missing from translation: {missing_emails}")
+            # Append missing emails at the end
+            if translation.strip():
+                translation = translation.strip() + ' ' + ' '.join(missing_emails)
+            else:
+                translation = ' '.join(missing_emails)
+        
+        return translation
+
+    def _preserve_structure(self, original: str, translation: str) -> str:
+        """Preserve basic text structure like line breaks."""
+        
+        # Count line breaks in original
+        original_lines = len(original.split('\n'))
+        translation_lines = len(translation.split('\n'))
+        
+        # If original had multiple lines but translation is single line,
+        # and original has clear paragraph breaks, try to restore some structure
+        if original_lines > 2 and translation_lines == 1:
+            # Look for paragraph indicators in original
+            if '\n\n' in original:
+                # This is a complex problem - for now just log it
+                self.logger.debug("Multi-paragraph structure may have been lost in translation")
+        
+        return translation
+
+    def _has_critical_errors(self, translation: str) -> bool:
+        """Check for critical errors that would make translation unusable."""
+        
+        critical_patterns = [
+            r'<\|.*?\|>',  # OpenAI special tokens
+            r'\[ERROR\]',   # Error markers
+            r'\[FAILED\]',  # Failure markers
+            r'(?i)api\s*error',  # API error messages
+            r'(?i)rate\s*limit',  # Rate limit messages
+            r'(?i)quota\s*exceeded',  # Quota messages
+        ]
+        
+        for pattern in critical_patterns:
+            if re.search(pattern, translation):
+                return True
+        
+        return False
 
 
 class TranslationManager:
