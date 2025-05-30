@@ -51,13 +51,13 @@ translation_validation:
 #--------------------
 openai:
   # BEST BALANCE: gpt-4o-mini is good, but with better settings
-  model: "gpt-4o-mini"
+  model: "gpt-3.5-turbo"
   
   # MAXIMUM CONSISTENCY: Zero temperature for job titles
   temperature: 0.0
   
   # ADEQUATE TOKENS: Job titles are short
-  max_tokens: 300
+  max_tokens: 500
   
   api_key_env: "OPENAI_API_KEY"
   
@@ -69,7 +69,7 @@ openai:
   request_timeout: 90
   
   # PROFESSIONAL PROMPT for job titles
-  custom_system_prompt: "You are a professional HR translator specializing in job titles and positions. Translate the job title from {source_language} to {target_language}. Maintain professional terminology and standard industry conventions. Output only the translated job title, nothing else."
+  # custom_system_prompt: "You are a professional HR translator specializing in job titles and positions. Translate the job title from {source_language} to {target_language}. Maintain professional terminology and standard industry conventions. Output only the translated job title, nothing else."
 
 #--------------------
 # CACHING SETTINGS - ENHANCED
@@ -206,3 +206,12 @@ monitoring:
   # ALERTS
   alert_on_high_error_rate: true
   error_rate_threshold: 0.05        # Alert if >5% error rate
+
+  translation_validation:
+  strict_mode: false                    # Disable strict validation
+  check_language_detection: false      # Disable language validation
+  min_length_ratio: 0.05              # Very lenient length check
+  max_length_ratio: 10.0              # Very lenient length check
+  preserve_numbers: true
+  preserve_urls: true
+  preserve_emails: true
